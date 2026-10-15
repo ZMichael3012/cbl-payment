@@ -18,6 +18,10 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	"github.com/cbl/cbl-kit/storagex"
 )
 
 // main поднимает gRPC-сервер сервиса, административный HTTP-сервер и сервер метрик.
@@ -28,12 +32,29 @@ func main() {
 	}
 	defer func() { _ = log.Sync() }()
 
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		log.Error("PG_DSN is required")
+		return
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Error("connect postgres failed", zap.Error(err))
+		return
+	}
+
 	httpAddr := getenv("HTTP_ADDR", ":8030")
 	grpcAddr := getenv("GRPC_ADDR", ":9030")
 	metricsAddr := getenv("METRICS_ADDR", ":9230")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	migrationsDir := getenv("MIGRATIONS_DIR", "./migrations")
+	if err := storagex.Migrate(ctx, db, migrationsDir); err != nil {
+		log.Error("apply migrations failed", zap.String("dir", migrationsDir), zap.Error(err))
+		return
+	}
 
 	router := gin.New()
 	router.Use(gin.Recovery())

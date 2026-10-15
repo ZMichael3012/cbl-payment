@@ -28,23 +28,31 @@ Out of scope: другие сервисы платформы; взаимодей
 Слои: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
 Библиотеки: стандартный набор `CBL-002` (Gin, GORM + pgx-драйвер, franz-go + pkg/sr, go-redis,
 goose, zap). `AutoMigrate` запрещен, миграции только goose, только вперед.
+Схема (4.1): `payments` (состояние, `state_version`, суммы, реквизиты),
+`payment_transitions` (append-only журнал переходов), `outbox`, `inbox`.
+Матрица переходов - `internal/domain/state.go`, дублируется триггером БД
+(`payments_transition_guard`); переходы только через `storage.Repository.Transition`
+с CAS по `state_version`.
 
 ## 4. Команды
 
 ```powershell
 make build        # go build ./...
 make test         # go test ./...
+make test-integration  # integration (testcontainers: PostgreSQL)
+make e2e          # compose-стенд: миграции, второй барьер БД, append-only журнал
 make vet          # go vet ./...
-make lint         # golangci-lint в Docker
-make up           # docker compose -f deploy/docker-compose.yml up -d
+make lint         # golangci-lint в Docker (контекст services/)
+make up           # docker compose -f deploy/docker-compose.yml --profile app up -d --build
 make down         # docker compose -f deploy/docker-compose.yml down -v
 ```
 
 ## 5. Порты и окружение
 
 HTTP `8030`, gRPC `9030`, метрики `9230`.
-Переменные (применимые к сервису): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`,
-`KAFKA_BROKERS`, `SCHEMA_REGISTRY_URL`, `REDIS_ADDR`.
+Переменные (применимые к сервису): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`
+(обязателен), `MIGRATIONS_DIR` (по умолчанию `./migrations`), `KAFKA_BROKERS`,
+`SCHEMA_REGISTRY_URL`, `REDIS_ADDR`.
 
 ## 6. Правила разработки
 
@@ -67,20 +75,37 @@ consumer lag; дашборды после задачи 0.7.
 
 | ID | Решение | Плюсы | Минусы и компенсация |
 | :-- | :-- | :-- | :-- |
+| T-PAY-01 | Матрица переходов в домене плюс два триггера БД (второй барьер): BEFORE INSERT фиксирует создание в `creating`/версии 1, BEFORE UPDATE проверяет пары состояний, инкремент `state_version`, неизменяемые поля и терминальные состояния | переходы не по порядку и создание платежа в обход автомата невозможны; аудит состояний полный | дублирование матрицы в Go и SQL, расходы триггеров на каждый переход; владелец БД может снять триггеры | матрица зеркалируется полным перебором пар в integration-тесте; цена триггера сравнима с леджером (T-LED-02); изменение правил - только миграцией; роли prod - KI-payment-03 |
+| T-PAY-02 | Оптимистичные переходы: чтение под row-локом и CAS по `state_version` | корректная история переходов, нет глобальных локов | при конкуренции на платеже один из переходов получает `ErrStateConflict` и повторяется | конфликты редки (переходы разных источников); повтор с чтением свежей версии - 4.3; метрика повторов в 0.7 |
+| T-PAY-03 | `updated_at` ведет триггер переходов | фоновые задачи (4.6) видят реальное время последнего движения | произвольное обновление `updated_at` в обход запрещено | «зависшие» определяются порогом времени, backdate не нужен |
 
 ## 9. Known issues
 
 | ID | Проблема | Влияние | План | Статус |
 | :-- | :-- | :-- | :-- | :-- |
 | KI-payment-01 | CI и pre-commit не настроены | линтеры запускаются вручную | задача 0.2 | open |
+| KI-payment-02 | Нет ротации и партиционирования `payments`, `payment_transitions`, `outbox`: таблицы растут бессрочно | рост БД и бэкапов; чтения по PK/индексам не страдают | ретеншен/партиционирование вместе с общим планом хранения (волна W4; задача-владелец пока не заведена) | open |
+| KI-payment-03 | Рантайм и миграции работают под одним DSN: владелец схемы может снять триггеры второго барьера (`DISABLE TRIGGER`, `session_replication_role`, `DROP TRIGGER`) | в dev-контуре второй барьер снимается владельцем БД; формально T-PAY-01 гарантирует защиту только от DML-ролей | разделить роли migrator (DDL) и runtime (DML без DDL) при выходе в prod (0.4/0.6); вне модели угроз dev-стенда | open |
 
 ## 10. Журнал задач
 
 | CBL | Дата | Статус | Спека | Коммит |
 | :-- | :-- | :-- | :-- | :-- |
+| CBL-4.1 | 2026-10-15 | done, ревью закрыто (схема payments+payment_transitions, матрица переходов в домене и БД, state_version с CAS, e2e полной цепочки, покрытие 83.5%) | `.specs/CBL-4.1-payment-schema.md` | этот коммит |
 
 ## 11. Runbook
 
 Заполняется первой продуктовой задачей сервиса. Типовые аварии: недоступность зависимости,
 рост ошибок, лаг обработки; действия: проверить health/metrics, логи с request_id, состояние
 Kafka consumer group и outbox lag, при необходимости перезапустить сервис.
+
+Автомат состояний (4.1):
+
+1. `ErrStateConflict` в логах: конкурентный переход на одном платеже; вызывающий повторяет
+   цикл с чтением свежей версии (`Get`). Систематика - проверить, не дублируются ли
+   канонические события (inbox 4.3).
+2. Состояние платежа и история: `SELECT state, state_version FROM payments WHERE id = '...'`;
+   полный путь переходов - `SELECT from_state, to_state, state_version, reason, occurred_at
+   FROM payment_transitions WHERE payment_id = '...' ORDER BY state_version`.
+3. Правка состояния напрямую в БД невозможна (триггер): исправление - только допустимый
+   переход через приложение или новая запись; `payment_transitions` append-only.
