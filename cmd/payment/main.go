@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +23,13 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
+	"github.com/cbl/cbl-kit/inbox"
+	"github.com/cbl/cbl-kit/inbox/kafkaconsumer"
+	"github.com/cbl/cbl-kit/outbox/kafkapub"
 	"github.com/cbl/cbl-kit/storagex"
+
+	"github.com/cbl/cbl-payment/internal/storage"
+	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
 // main поднимает gRPC-сервер сервиса, административный HTTP-сервер и сервер метрик.
@@ -43,6 +51,20 @@ func main() {
 		return
 	}
 
+	// Пул ограничен по образцу леджера (T-LED-04): consumer и gRPC делят
+	// соединения, опечатка в env не должна исчерпать max_connections.
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Error("resolve sql db failed", zap.Error(err))
+		return
+	}
+	maxOpen := min(getenvInt("DB_MAX_OPEN_CONNS", 20), 100)
+	maxIdle := min(getenvInt("DB_MAX_IDLE_CONNS", 10), maxOpen)
+	sqlDB.SetMaxOpenConns(maxOpen)
+	sqlDB.SetMaxIdleConns(maxIdle)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	log.Info("postgres pool configured", zap.Int("max_open", maxOpen), zap.Int("max_idle", maxIdle))
+
 	httpAddr := getenv("HTTP_ADDR", ":8030")
 	grpcAddr := getenv("GRPC_ADDR", ":9030")
 	metricsAddr := getenv("METRICS_ADDR", ":9230")
@@ -54,6 +76,42 @@ func main() {
 	if err := storagex.Migrate(ctx, db, migrationsDir); err != nil {
 		log.Error("apply migrations failed", zap.String("dir", migrationsDir), zap.Error(err))
 		return
+	}
+
+	repo := storage.NewRepository(db)
+	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
+		brokerList := splitCSV(brokers)
+		publisher, pubErr := kafkapub.New(brokerList)
+		if pubErr != nil {
+			log.Error("kafka publisher failed", zap.Error(pubErr))
+			return
+		}
+		defer publisher.Close()
+
+		group := getenv("KAFKA_CONSUMER_GROUP", usecase.ConsumerGroupCanonical)
+		consumer := usecase.NewCanonicalConsumer(repo, log)
+		processor := inbox.NewProcessor(group, db, inbox.NewGuard(), consumer, publisher,
+			inbox.NewRouter(usecase.TopicGatewayEventsCanonical, 3), log)
+		topics := []string{
+			usecase.TopicGatewayEventsCanonical,
+			usecase.TopicGatewayEventsCanonical + inbox.RetrySuffix5s,
+			usecase.TopicGatewayEventsCanonical + inbox.RetrySuffix1m,
+			usecase.TopicGatewayEventsCanonical + inbox.RetrySuffix10m,
+		}
+		runner, runErr := kafkaconsumer.New(brokerList, group, topics, processor, log)
+		if runErr != nil {
+			log.Error("canonical consumer failed", zap.Error(runErr))
+			return
+		}
+		defer runner.Close()
+		go func() {
+			if consumeErr := runner.Run(ctx); consumeErr != nil && !errors.Is(consumeErr, context.Canceled) {
+				log.Error("canonical consumer stopped", zap.Error(consumeErr))
+			}
+		}()
+		log.Info("canonical consumer started", zap.String("group", group))
+	} else {
+		log.Warn("KAFKA_BROKERS is empty: canonical consumer disabled")
 	}
 
 	router := gin.New()
@@ -132,4 +190,28 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getenvInt возвращает положительное целое из переменной окружения
+// или значение по умолчанию.
+func getenvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+// splitCSV разбирает список значений из переменной окружения через запятую,
+// отбрасывая пустые элементы и пробелы вокруг них.
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+	return values
 }

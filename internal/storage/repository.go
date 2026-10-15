@@ -140,6 +140,8 @@ type TransitionPatch struct {
 	Provider *string
 	// TxID задает хэш транзакции сети.
 	TxID *string
+	// Network задает сеть оплаты из канонического события.
+	Network *string
 	// Confirmations задает число подтверждений.
 	Confirmations *int
 	// ExpiresAt задает срок действия счета.
@@ -209,8 +211,18 @@ func (r *Repository) Create(ctx context.Context, payment Payment) error {
 // домена, обновляет платеж условием state_version = expectedVersion и пишет
 // строку журнала. Конфликт версии - domain.ErrStateConflict.
 func (r *Repository) Transition(ctx context.Context, id string, expectedVersion uint64, to domain.State, patch TransitionPatch) (Payment, error) {
+	return r.TransitionTx(ctx, nil, id, expectedVersion, to, patch)
+}
+
+// TransitionTx выполняет переход в переданной транзакции (tx=nil - своя):
+// consumer канонических событий пишет переход атомарно с inbox-записью Guard.
+func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, expectedVersion uint64, to domain.State, patch TransitionPatch) (Payment, error) {
+	db := tx
+	if db == nil {
+		db = r.db
+	}
 	var updated Payment
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current Payment
 		findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", id).First(&current).Error
@@ -284,6 +296,29 @@ func (r *Repository) Get(ctx context.Context, id string) (Payment, []Transition,
 		return Payment{}, nil, fmt.Errorf("storage: get payment %s: %w", id, err)
 	}
 	return payment, history, nil
+}
+
+// Payment возвращает платеж без истории переходов.
+func (r *Repository) Payment(ctx context.Context, id string) (Payment, error) {
+	return r.PaymentTx(ctx, nil, id)
+}
+
+// PaymentTx возвращает платеж без истории в переданной транзакции
+// (tx=nil - своя): consumer читает состояние в транзакции Guard.
+func (r *Repository) PaymentTx(ctx context.Context, tx *gorm.DB, id string) (Payment, error) {
+	db := tx
+	if db == nil {
+		db = r.db
+	}
+	var payment Payment
+	err := db.WithContext(ctx).Where("id = ?", id).First(&payment).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Payment{}, fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("storage: get payment %s: %w", id, err)
+	}
+	return payment, nil
 }
 
 // List возвращает страницу платежей мерчанта и курсор следующей страницы.
@@ -402,6 +437,9 @@ func (p TransitionPatch) updates() map[string]any {
 	}
 	if p.TxID != nil {
 		updates["txid"] = *p.TxID
+	}
+	if p.Network != nil {
+		updates["network"] = *p.Network
 	}
 	if p.Confirmations != nil {
 		updates["confirmations"] = *p.Confirmations
