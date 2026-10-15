@@ -137,6 +137,7 @@ func TestShouldExpire(t *testing.T) {
 
 	assert.True(t, domain.ShouldExpire(domain.StatePending, &past, now))
 	assert.True(t, domain.ShouldExpire(domain.StateCreated, &past, now))
+	assert.True(t, domain.ShouldExpire(domain.StatePending, &now, now), "граница равенства: expires_at == now истекает")
 	assert.False(t, domain.ShouldExpire(domain.StateCreated, &future, now))
 	assert.False(t, domain.ShouldExpire(domain.StatePending, nil, now), "без срока истечения нет")
 	assert.False(t, domain.ShouldExpire(domain.StateCreating, &past, now), "creating доводится фоном")

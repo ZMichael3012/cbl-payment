@@ -31,6 +31,11 @@ const (
 	maxListLimit     = 200
 )
 
+// Границы пакетов фоновых выборок (janitor 4.6): отдельный, более высокий
+// потолок, чем у пользовательского списка, чтобы разгребание backlog шло
+// пачками без деградации интерактивных запросов.
+const maxBackgroundLimit = 1000
+
 // Payment описывает строку таблицы payments.
 type Payment struct {
 	// ID задает UUIDv7 платежа.
@@ -379,13 +384,24 @@ func (r *Repository) FindStuck(ctx context.Context, olderThan time.Time, limit i
 		"updated_at ASC", limit)
 }
 
-// findByFilter выполняет выборку платежей по условию с ограничением страницы.
+// FindCreating возвращает зависшие создания для 4.6: платежи в creating,
+// созданные не позже порога; штатное создание (4.2) укладывается в секунды,
+// порог задает вызывающий (janitor).
+func (r *Repository) FindCreating(ctx context.Context, olderThan time.Time, limit int) ([]Payment, error) {
+	return r.findByFilter(ctx,
+		"state = ? AND created_at <= ?",
+		[]any{string(domain.StateCreating), olderThan.UTC()},
+		"created_at ASC", limit)
+}
+
+// findByFilter выполняет выборку платежей по условию с ограничением пакета
+// фоновых задач (потолок maxBackgroundLimit).
 func (r *Repository) findByFilter(ctx context.Context, where string, args []any, order string, limit int) ([]Payment, error) {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
-	if limit > maxListLimit {
-		limit = maxListLimit
+	if limit > maxBackgroundLimit {
+		limit = maxBackgroundLimit
 	}
 	var payments []Payment
 	err := r.db.WithContext(ctx).

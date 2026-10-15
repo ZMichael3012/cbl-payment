@@ -387,6 +387,63 @@ func TestIntegrationFindExpiredAndStuck(t *testing.T) {
 	assert.Empty(t, fresh, "свежий платеж не считается зависшим")
 }
 
+func TestIntegrationFindCreating(t *testing.T) {
+	db := setupPaymentDB(t)
+	repo := storage.NewRepository(db)
+	ctx := context.Background()
+
+	fresh := newPayment(t, "creating-fresh")
+	require.NoError(t, repo.Create(ctx, fresh))
+
+	stuck := newPayment(t, "creating-stuck")
+	require.NoError(t, db.Exec(`INSERT INTO payments
+		(id, merchant_id, idempotency_key, request_hash, state, state_version,
+		 expected_amount, expected_asset, expected_decimals, network, created_at, updated_at)
+		VALUES (?, 'm-1', 'creating-stuck', 'hash', 'creating', 1, 100000, 'USDT', 2, 'trc20',
+		        now() - interval '10 minutes', now() - interval '10 minutes')`, stuck.ID).Error)
+
+	advanced := paymentAtState(t, repo, "creating-advanced", domain.StateCreated)
+
+	found, err := repo.FindCreating(ctx, time.Now().UTC().Add(-5*time.Minute), 10)
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	assert.Equal(t, stuck.ID, found[0].ID)
+
+	none, err := repo.FindCreating(ctx, time.Now().UTC().Add(-time.Hour), 10)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+
+	found, err = repo.FindCreating(ctx, time.Now().UTC().Add(time.Minute), 10)
+	require.NoError(t, err)
+	require.Len(t, found, 2, "свежее и зависшее создания")
+	for _, row := range found {
+		assert.NotEqual(t, advanced.ID, row.ID, "нетерминальное создание вне creating не попадает в выборку")
+	}
+}
+
+// TestIntegrationFindCreatingBatchBeyondListLimit проверяет, что пакет фоновых
+// выборок не урезается потолком пользовательского списка (200).
+func TestIntegrationFindCreatingBatchBeyondListLimit(t *testing.T) {
+	db := setupPaymentDB(t)
+	repo := storage.NewRepository(db)
+	ctx := context.Background()
+
+	require.NoError(t, db.Exec(`INSERT INTO payments
+		(id, merchant_id, idempotency_key, request_hash, state, state_version,
+		 expected_amount, expected_asset, expected_decimals, network, created_at, updated_at)
+		SELECT gen_random_uuid(), 'm-batch', 'batch-' || i, 'hash', 'creating', 1, 100000, 'USDT', 2, 'trc20',
+		       now() - interval '1 hour', now() - interval '1 hour'
+		FROM generate_series(1, 205) AS i`).Error)
+
+	found, err := repo.FindCreating(ctx, time.Now().UTC(), 250)
+	require.NoError(t, err)
+	assert.Len(t, found, 205, "пакет фоновых выборок не режется лимитом списка")
+
+	page, err := repo.FindCreating(ctx, time.Now().UTC(), 50)
+	require.NoError(t, err)
+	assert.Len(t, page, 50)
+}
+
 func TestIntegrationConstraints(t *testing.T) {
 	db := setupPaymentDB(t)
 	repo := storage.NewRepository(db)

@@ -1,8 +1,9 @@
-# E2E CBL-4.1: схема платежа и автомат состояний на compose-стенде payment.
+# E2E CBL-4.1/4.6: схема платежа, автомат состояний и фоновые задачи на compose-стенде payment.
 # Запуск из каталога сервиса: powershell -NoProfile -File test/e2e/schema.ps1
-# Сценарий: compose up -> миграции (версия 3) -> полная цепочка состояний
+# Сценарий: compose up -> миграции (версия 4) -> полная цепочка состояний
 # creating -> created -> pending -> detected -> confirming -> completed,
-# запрещенные переходы и append-only журнал отклоняются вторым барьером БД.
+# запрещенные переходы и append-only журнал отклоняются вторым барьером БД,
+# janitor истекает просроченный счет, закрывает зависшее создание и не трогает detected.
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -38,7 +39,7 @@ try {
     foreach ($attempt in 1..30) {
         try {
             $version = Invoke-Psql "SELECT max(version_id) FROM goose_db_version"
-            if ($version -eq "3") { $migrated = $true; break }
+            if ($version -eq "4") { $migrated = $true; break }
         } catch {
             Start-Sleep -Seconds 2
         }
@@ -73,7 +74,59 @@ try {
     # Журнал переходов append-only.
     Assert-PsqlFails "UPDATE payment_transitions SET reason = 'rewritten' WHERE payment_id = '$paymentId'" "transition rewrite" "append-only"
 
-    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected"
+    # Janitor (4.6): просроченный счет истекает, зависшее создание закрывается failed.
+    # Цепочки строятся одним вызовом psql (одна неявная транзакция): janitor с
+    # интервалом 2s не должен вмешаться между шагами.
+    $expiredId = [guid]::NewGuid().ToString()
+    $expiredSql = @"
+INSERT INTO payments (id, merchant_id, idempotency_key, request_hash, state, expected_amount, expected_asset, expected_decimals, network, expires_at) VALUES ('$expiredId', 'm-e2e', 'key-exp', 'hash-exp', 'creating', 1000, 'USDT', 2, 'trc20', now() - interval '1 minute');
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$expiredId', '', 'creating', 1, 'created');
+UPDATE payments SET state = 'created', state_version = 2 WHERE id = '$expiredId';
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$expiredId', 'creating', 'created', 2, 'e2e');
+UPDATE payments SET state = 'pending', state_version = 3 WHERE id = '$expiredId';
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$expiredId', 'created', 'pending', 3, 'e2e');
+"@
+    Invoke-Psql $expiredSql | Out-Null
+
+    # Зависшее создание: created_at в прошлом разрешен на INSERT (immutable только для UPDATE).
+    $stuckCreateId = [guid]::NewGuid().ToString()
+    $stuckCreateSql = @"
+INSERT INTO payments (id, merchant_id, idempotency_key, request_hash, state, expected_amount, expected_asset, expected_decimals, network, created_at, updated_at) VALUES ('$stuckCreateId', 'm-e2e', 'key-stuck', 'hash-stuck', 'creating', 1000, 'USDT', 2, 'trc20', now() - interval '10 minutes', now() - interval '10 minutes');
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$stuckCreateId', '', 'creating', 1, 'created');
+"@
+    Invoke-Psql $stuckCreateSql | Out-Null
+
+    # Обнаруженная оплата с истекшим expires_at не истекает (KI-payment-08).
+    $detectedId = [guid]::NewGuid().ToString()
+    $detectedSql = @"
+INSERT INTO payments (id, merchant_id, idempotency_key, request_hash, state, expected_amount, expected_asset, expected_decimals, network, expires_at) VALUES ('$detectedId', 'm-e2e', 'key-det', 'hash-det', 'creating', 1000, 'USDT', 2, 'trc20', now() - interval '1 minute');
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$detectedId', '', 'creating', 1, 'created');
+UPDATE payments SET state = 'created', state_version = 2 WHERE id = '$detectedId';
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$detectedId', 'creating', 'created', 2, 'e2e');
+UPDATE payments SET state = 'pending', state_version = 3 WHERE id = '$detectedId';
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$detectedId', 'created', 'pending', 3, 'e2e');
+UPDATE payments SET state = 'detected', state_version = 4 WHERE id = '$detectedId';
+INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$detectedId', 'pending', 'detected', 4, 'e2e');
+"@
+    Invoke-Psql $detectedSql | Out-Null
+
+    $janitorDone = $false
+    foreach ($attempt in 1..20) {
+        $expiredState = Invoke-Psql "SELECT state FROM payments WHERE id = '$expiredId'"
+        $stuckState = Invoke-Psql "SELECT state FROM payments WHERE id = '$stuckCreateId'"
+        if ($expiredState -eq "expired" -and $stuckState -eq "failed") { $janitorDone = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $janitorDone) { throw "janitor did not process payments (expired=$expiredState, stuck=$stuckState)" }
+
+    $expiredReason = Invoke-Psql "SELECT reason FROM payment_transitions WHERE payment_id = '$expiredId' AND to_state = 'expired'"
+    if ($expiredReason -ne "janitor expired") { throw "unexpected expiry reason: $expiredReason" }
+    $stuckReason = Invoke-Psql "SELECT reason FROM payment_transitions WHERE payment_id = '$stuckCreateId' AND to_state = 'failed'"
+    if ($stuckReason -ne "janitor creating timeout") { throw "unexpected creating failure reason: $stuckReason" }
+    $detectedState = Invoke-Psql "SELECT state || ':' || state_version FROM payments WHERE id = '$detectedId'"
+    if ($detectedState -ne "detected:4") { throw "janitor must not touch detected payment: $detectedState" }
+
+    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected, janitor expired+creating_failed+detected intact"
 } finally {
     docker compose -f $ComposeFile --profile app down -v | Out-Null
     Pop-Location

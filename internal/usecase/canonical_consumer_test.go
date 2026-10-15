@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/proto"
 	"gorm.io/gorm"
 
@@ -391,6 +393,22 @@ func TestCanonicalConsumerPolicyCompletesAtThreshold(t *testing.T) {
 
 	assert.Equal(t, string(domain.StateCompleted), store.payment.State)
 	assert.Equal(t, []domain.State{domain.StateConfirming, domain.StateCompleted}, store.transitions)
+}
+
+func TestCanonicalConsumerLateDetectedAfterExpiryAlerts(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore(domain.StateExpired, 5)
+	core, logs := observer.New(zap.WarnLevel)
+	consumer := usecase.NewCanonicalConsumer(store, zap.New(core))
+
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, detectedEvent())))
+	assert.Equal(t, string(domain.StateExpired), store.payment.State)
+	assert.Equal(t, int64(5), store.payment.StateVersion, "позднее событие не меняет состояние")
+	assert.Empty(t, store.transitions)
+
+	require.Len(t, logs.All(), 1, "поздняя оплата после истечения - отдельный алерт (KI-payment-08)")
+	assert.Equal(t, "late canonical event after expiry needs manual review", logs.All()[0].Message)
 }
 
 func TestCanonicalConsumerPolicyWaitsBelowThreshold(t *testing.T) {

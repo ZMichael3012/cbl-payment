@@ -143,6 +143,20 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 			return fmt.Errorf("usecase: canonical plan for %s: %w", payment.ID, planErr)
 		}
 		if len(plan) == 0 {
+			// Деньги в сети после истечения счета требуют ручного разбора
+			// (KI-payment-08): событие в порядке обработки опоздало, но
+			// оплату нельзя просто отбросить - отдельное сообщение для
+			// алертов по логам (метрики - 0.7).
+			if current == domain.StateExpired &&
+				(eventType == domain.CanonicalDetected || eventType == domain.CanonicalConfirmed) {
+				c.log.Warn("late canonical event after expiry needs manual review",
+					zap.String("payment_id", payment.ID),
+					zap.String("type", string(eventType)),
+					zap.String("state", string(current)),
+					zap.Int64("state_version", payment.StateVersion),
+					zap.String("traceparent", traceparent))
+				return nil
+			}
 			c.log.Warn("stale canonical event skipped",
 				zap.String("payment_id", payment.ID),
 				zap.String("type", string(eventType)),

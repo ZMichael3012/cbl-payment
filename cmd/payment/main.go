@@ -96,6 +96,47 @@ func main() {
 		return
 	}
 	log.Info("payment amount policy configured", zap.String("policy", policy.Describe()))
+
+	janitorInterval, durationErr := parseDurationEnv("PAYMENT_JANITOR_INTERVAL", usecase.DefaultJanitorInterval, time.Second, true)
+	if durationErr != nil {
+		log.Error("parse PAYMENT_JANITOR_INTERVAL failed", zap.Error(durationErr))
+		return
+	}
+	creatingTimeout, durationErr := parseDurationEnv("PAYMENT_CREATING_TIMEOUT", usecase.DefaultCreatingTimeout, time.Minute, false)
+	if durationErr != nil {
+		log.Error("parse PAYMENT_CREATING_TIMEOUT failed", zap.Error(durationErr))
+		return
+	}
+	stuckTimeout, durationErr := parseDurationEnv("PAYMENT_STUCK_TIMEOUT", usecase.DefaultStuckTimeout, time.Minute, false)
+	if durationErr != nil {
+		log.Error("parse PAYMENT_STUCK_TIMEOUT failed", zap.Error(durationErr))
+		return
+	}
+	janitorBatch, batchErr := parseBatchEnv("PAYMENT_JANITOR_BATCH", usecase.DefaultJanitorBatch)
+	if batchErr != nil {
+		log.Error("parse PAYMENT_JANITOR_BATCH failed", zap.Error(batchErr))
+		return
+	}
+	if janitorInterval > 0 {
+		janitor, janitorErr := usecase.NewJanitor(repo, log, usecase.JanitorConfig{
+			Interval:      janitorInterval,
+			Batch:         janitorBatch,
+			CreatingAfter: creatingTimeout,
+			StuckAfter:    stuckTimeout,
+		})
+		if janitorErr != nil {
+			log.Error("payment janitor configuration failed", zap.Error(janitorErr))
+			return
+		}
+		go janitor.Run(ctx)
+		log.Info("payment janitor started",
+			zap.Duration("interval", janitorInterval),
+			zap.Int("batch", janitorBatch),
+			zap.Duration("creating_timeout", creatingTimeout),
+			zap.Duration("stuck_timeout", stuckTimeout))
+	} else {
+		log.Warn("payment janitor disabled (PAYMENT_JANITOR_INTERVAL=0)")
+	}
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		brokerList := splitCSV(brokers)
 		publisher, pubErr := kafkapub.New(brokerList)
@@ -231,6 +272,44 @@ func parseToleranceBPS(raw string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 0 || value > 10000 {
 		return 0, fmt.Errorf("invalid bps %q", raw)
+	}
+	return value, nil
+}
+
+// parseDurationEnv разбирает длительность из переменной окружения: пустое
+// значение - значение по умолчанию; невалидное, отрицательное или меньше
+// минимума - ошибка; ноль допускается только при allowZero (интервал janitor-а:
+// 0 - выключен). Минимумы защищают от опечаток вроде PAYMENT_CREATING_TIMEOUT=1s,
+// которые массово закрывали бы живые создания 4.2.
+func parseDurationEnv(key string, fallback, minimum time.Duration, allowZero bool) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, raw, err)
+	}
+	if allowZero && value == 0 {
+		return 0, nil
+	}
+	if value < minimum {
+		return 0, fmt.Errorf("invalid %s %q: minimum %s", key, raw, minimum)
+	}
+	return value, nil
+}
+
+// parseBatchEnv разбирает размер пакета janitor-а: пустое значение - значение
+// по умолчанию; невалидное или неположительное - ошибка (потолок проверяет
+// usecase.NewJanitor).
+func parseBatchEnv(key string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid %s %q", key, raw)
 	}
 	return value, nil
 }
