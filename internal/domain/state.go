@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // Ошибки автомата состояний платежа.
@@ -118,6 +119,49 @@ func AllowedTransition(from, to State) bool {
 func Terminal(state State) bool {
 	_, ok := terminalStates[state]
 	return ok
+}
+
+// ChainTo возвращает кратчайшую цепочку переходов из состояния from в to
+// по матрице автомата; пустая цепочка означает совпадение состояний.
+func ChainTo(from, to State) ([]State, error) {
+	if _, err := ParseState(string(from)); err != nil {
+		return nil, err
+	}
+	if _, err := ParseState(string(to)); err != nil {
+		return nil, err
+	}
+	if from == to {
+		return nil, nil
+	}
+	if Terminal(from) {
+		return nil, fmt.Errorf("%w: %s", ErrTerminalState, from)
+	}
+	type node struct {
+		state State
+		path  []State
+	}
+	queue := []node{{state: from}}
+	visited := map[State]struct{}{from: {}}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		nexts := make([]State, 0, len(transitions[current.state]))
+		for target := range transitions[current.state] {
+			nexts = append(nexts, target)
+		}
+		sort.Slice(nexts, func(i, j int) bool { return nexts[i] < nexts[j] })
+		for _, target := range nexts {
+			path := append(append([]State{}, current.path...), target)
+			if target == to {
+				return path, nil
+			}
+			if _, ok := visited[target]; !ok {
+				visited[target] = struct{}{}
+				queue = append(queue, node{state: target, path: path})
+			}
+		}
+	}
+	return nil, fmt.Errorf("%w: %s -> %s", ErrForbiddenTransition, from, to)
 }
 
 // NextVersion проверяет переход и возвращает новую версию состояния.

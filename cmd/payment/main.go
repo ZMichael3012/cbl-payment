@@ -28,6 +28,7 @@ import (
 	"github.com/cbl/cbl-kit/outbox/kafkapub"
 	"github.com/cbl/cbl-kit/storagex"
 
+	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
@@ -79,6 +80,22 @@ func main() {
 	}
 
 	repo := storage.NewRepository(db)
+	underBPS, bpsErr := parseToleranceBPS(os.Getenv("PAYMENT_UNDERPAID_TOLERANCE_BPS"))
+	if bpsErr != nil {
+		log.Error("parse PAYMENT_UNDERPAID_TOLERANCE_BPS failed", zap.Error(bpsErr))
+		return
+	}
+	overBPS, bpsErr := parseToleranceBPS(os.Getenv("PAYMENT_OVERPAID_TOLERANCE_BPS"))
+	if bpsErr != nil {
+		log.Error("parse PAYMENT_OVERPAID_TOLERANCE_BPS failed", zap.Error(bpsErr))
+		return
+	}
+	policy, policyErr := domain.ParseAmountPolicy(os.Getenv("PAYMENT_CONFIRMATION_POLICY"), underBPS, overBPS)
+	if policyErr != nil {
+		log.Error("parse PAYMENT_CONFIRMATION_POLICY failed", zap.Error(policyErr))
+		return
+	}
+	log.Info("payment amount policy configured", zap.String("policy", policy.Describe()))
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		brokerList := splitCSV(brokers)
 		publisher, pubErr := kafkapub.New(brokerList)
@@ -89,7 +106,7 @@ func main() {
 		defer publisher.Close()
 
 		group := getenv("KAFKA_CONSUMER_GROUP", usecase.ConsumerGroupCanonical)
-		consumer := usecase.NewCanonicalConsumer(repo, log)
+		consumer := usecase.NewCanonicalConsumer(repo, log, usecase.WithAmountPolicy(policy))
 		processor := inbox.NewProcessor(group, db, inbox.NewGuard(), consumer, publisher,
 			inbox.NewRouter(usecase.TopicGatewayEventsCanonical, 3), log)
 		topics := []string{
@@ -201,6 +218,21 @@ func getenvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// parseToleranceBPS разбирает толеранс в базисных пунктах: пустое значение - 0,
+// невалидное или вне диапазона 0 - 10000 - ошибка: денежное решение не должно
+// молча деградировать из-за опечатки в конфигурации.
+func parseToleranceBPS(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 || value > 10000 {
+		return 0, fmt.Errorf("invalid bps %q", raw)
+	}
+	return value, nil
 }
 
 // splitCSV разбирает список значений из переменной окружения через запятую,

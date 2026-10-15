@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,6 +47,7 @@ func newFakeStore(state domain.State, version int64) *fakeCanonicalStore {
 		ID:               canonicalPaymentID,
 		State:            string(state),
 		StateVersion:     version,
+		ExpectedAmount:   100_000,
 		ExpectedAsset:    "USDT",
 		ExpectedDecimals: 2,
 	}}
@@ -84,6 +86,9 @@ func (f *fakeCanonicalStore) TransitionTx(_ context.Context, _ *gorm.DB, _ strin
 	}
 	if patch.Confirmations != nil {
 		f.payment.Confirmations = *patch.Confirmations
+	}
+	if patch.CompletedAt != nil {
+		f.payment.CompletedAt = patch.CompletedAt
 	}
 	f.transitions = append(f.transitions, to)
 	f.patches = append(f.patches, patch)
@@ -306,6 +311,12 @@ func TestCanonicalConsumerAllEventTypes(t *testing.T) {
 			consumer := usecase.NewCanonicalConsumer(store, nil)
 			event := detectedEvent()
 			event.Type = eventType
+			switch eventType {
+			case eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_UNDERPAID:
+				event.ReceivedAmount = &commonv1.Money{MinorUnits: 99_000, Asset: "USDT", Decimals: 2}
+			case eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_OVERPAID:
+				event.ReceivedAmount = &commonv1.Money{MinorUnits: 101_000, Asset: "USDT", Decimals: 2}
+			}
 			require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 			assert.Equal(t, string(want), store.payment.State)
 		})
@@ -358,8 +369,136 @@ func TestCanonicalConsumerUnderpaidChainFromPending(t *testing.T) {
 
 	event := detectedEvent()
 	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_UNDERPAID
+	event.ReceivedAmount = &commonv1.Money{MinorUnits: 99_000, Asset: "USDT", Decimals: 2}
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 
 	assert.Equal(t, string(domain.StateUnderpaid), store.payment.State)
 	assert.Equal(t, []domain.State{domain.StateDetected, domain.StateUnderpaid}, store.transitions)
+}
+
+func TestCanonicalConsumerPolicyCompletesAtThreshold(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore(domain.StateDetected, 4)
+	policy, err := domain.ParseAmountPolicy(`{"USDT":[{"below_minor":1000000,"confirmations":1}]}`, 0, 0)
+	require.NoError(t, err)
+	consumer := usecase.NewCanonicalConsumer(store, nil, usecase.WithAmountPolicy(policy))
+
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.Confirmations = 1
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+
+	assert.Equal(t, string(domain.StateCompleted), store.payment.State)
+	assert.Equal(t, []domain.State{domain.StateConfirming, domain.StateCompleted}, store.transitions)
+}
+
+func TestCanonicalConsumerPolicyWaitsBelowThreshold(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore(domain.StateDetected, 4)
+	consumer := usecase.NewCanonicalConsumer(store, nil)
+
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.Confirmations = 5
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+
+	assert.Equal(t, string(domain.StateConfirming), store.payment.State, "порог по умолчанию 6")
+	assert.Equal(t, 5, store.payment.Confirmations)
+
+	// Повторный confirmed ниже порога - self-переход с ростом confirmations.
+	event.Confirmations = 6
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "достижение порога завершает")
+}
+
+func TestCanonicalConsumerSelfTransitionConfirming(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore(domain.StateConfirming, 5)
+	consumer := usecase.NewCanonicalConsumer(store, nil)
+
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.Confirmations = 3
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+
+	assert.Equal(t, string(domain.StateConfirming), store.payment.State)
+	assert.Equal(t, int64(6), store.payment.StateVersion, "self-переход растит версию")
+	assert.Equal(t, 3, store.payment.Confirmations)
+	assert.Equal(t, []domain.State{domain.StateConfirming}, store.transitions)
+}
+
+func TestCanonicalConsumerPolicyClassifiesByAmount(t *testing.T) {
+	t.Parallel()
+
+	// canonical confirmed с суммой ниже толеранса: политика переводит в underpaid.
+	store := newFakeStore(domain.StatePending, 2)
+	consumer := usecase.NewCanonicalConsumer(store, nil)
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.ReceivedAmount = &commonv1.Money{MinorUnits: 99_000, Asset: "USDT", Decimals: 2}
+	event.Confirmations = 6
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+	assert.Equal(t, string(domain.StateUnderpaid), store.payment.State)
+
+	// Переплата в толерансе 2% - политика завершает completed.
+	policy, err := domain.ParseAmountPolicy("", 0, 200)
+	require.NoError(t, err)
+	overpaidStore := newFakeStore(domain.StateConfirming, 5)
+	overpaidConsumer := usecase.NewCanonicalConsumer(overpaidStore, nil, usecase.WithAmountPolicy(policy))
+	overpaid := detectedEvent()
+	overpaid.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_OVERPAID
+	overpaid.ReceivedAmount = &commonv1.Money{MinorUnits: 102_000, Asset: "USDT", Decimals: 2}
+	overpaid.Confirmations = 6
+	require.NoError(t, overpaidConsumer.Handle(context.Background(), nil, canonicalMessage(t, overpaid)))
+	assert.Equal(t, string(domain.StateCompleted), overpaidStore.payment.State, "переплата в толерансе завершается")
+}
+
+func TestCanonicalConsumerCompletedAtUsesClock(t *testing.T) {
+	t.Parallel()
+
+	fixed := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	policy, err := domain.ParseAmountPolicy(`{"USDT":[{"below_minor":1000000,"confirmations":1}]}`, 0, 0)
+	require.NoError(t, err)
+	store := newFakeStore(domain.StateDetected, 4)
+	consumer := usecase.NewCanonicalConsumer(store, nil,
+		usecase.WithAmountPolicy(policy),
+		usecase.WithClock(func() time.Time { return fixed }))
+
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.Confirmations = 1
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+
+	require.NotNil(t, store.payment.CompletedAt)
+	assert.Equal(t, fixed, *store.payment.CompletedAt, "completed_at берется из часов consumer-а")
+}
+
+func TestCanonicalConsumerPolicyToleranceWins(t *testing.T) {
+	t.Parallel()
+
+	policy, err := domain.ParseAmountPolicy("", 100, 0)
+	require.NoError(t, err)
+
+	// Недоплата в пределах 1% при достигнутом пороге - политика завершает.
+	store := newFakeStore(domain.StateDetected, 4)
+	consumer := usecase.NewCanonicalConsumer(store, nil, usecase.WithAmountPolicy(policy))
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_UNDERPAID
+	event.ReceivedAmount = &commonv1.Money{MinorUnits: 99_500, Asset: "USDT", Decimals: 2}
+	event.Confirmations = 6
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
+	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "canonical underpaid в толерансе завершается политикой")
+
+	// Недоплата в толерансе без порога подтверждений - ожидание.
+	waiting := newFakeStore(domain.StateDetected, 4)
+	waitingConsumer := usecase.NewCanonicalConsumer(waiting, nil, usecase.WithAmountPolicy(policy))
+	waitEvent := detectedEvent()
+	waitEvent.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	waitEvent.ReceivedAmount = &commonv1.Money{MinorUnits: 99_500, Asset: "USDT", Decimals: 2}
+	waitEvent.Confirmations = 1
+	require.NoError(t, waitingConsumer.Handle(context.Background(), nil, canonicalMessage(t, waitEvent)))
+	assert.Equal(t, string(domain.StateConfirming), waiting.payment.State)
 }

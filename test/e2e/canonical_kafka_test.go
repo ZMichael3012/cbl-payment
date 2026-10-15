@@ -170,7 +170,9 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	require.NoError(t, err)
 	defer publisher.Close()
 
-	consumer := usecase.NewCanonicalConsumer(repo, zap.NewNop())
+	policy, err := domain.ParseAmountPolicy(`{"USDT":[{"below_minor":1000000,"confirmations":1}]}`, 0, 0)
+	require.NoError(t, err)
+	consumer := usecase.NewCanonicalConsumer(repo, zap.NewNop(), usecase.WithAmountPolicy(policy))
 	processor := inbox.NewProcessor(usecase.ConsumerGroupCanonical, db, inbox.NewGuard(), consumer, publisher,
 		inbox.NewRouter(usecase.TopicGatewayEventsCanonical, 3), zap.NewNop())
 	topic := usecase.TopicGatewayEventsCanonical
@@ -198,21 +200,19 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	require.NoError(t, producer.ProduceSync(ctx, detected).FirstErr())
 	confirmed := canonicalRecord(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED, 3)
 	require.NoError(t, producer.ProduceSync(ctx, confirmed).FirstErr())
-	confirmedPayment := waitForState(t, ctx, repo, domain.StateConfirming)
-	assert.Equal(t, 3, confirmedPayment.Confirmations)
-	assert.Equal(t, detectedPayment.StateVersion+1, confirmedPayment.StateVersion,
-		"дубликат не создал лишний переход")
+	completedPayment := waitForState(t, ctx, repo, domain.StateCompleted)
+	assert.Equal(t, 3, completedPayment.Confirmations)
+	assert.Equal(t, detectedPayment.StateVersion+2, completedPayment.StateVersion,
+		"дубликат не создал лишний переход; подтверждение завершило платеж по политике")
 
 	// Устаревшее detected после терминального состояния - no-op.
-	completed, err := repo.Transition(ctx, canonicalE2EPaymentID, uint64(confirmedPayment.StateVersion), domain.StateCompleted, storage.TransitionPatch{})
-	require.NoError(t, err)
 	stale := canonicalRecord(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_DETECTED, 1)
 	require.NoError(t, producer.ProduceSync(ctx, stale).FirstErr())
 	waitForInboxCount(t, ctx, db, 3)
 	after, history, err := repo.Get(ctx, canonicalE2EPaymentID)
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.StateCompleted), after.State)
-	assert.Equal(t, completed.StateVersion, after.StateVersion, "устаревшее событие не меняет состояние")
+	assert.Equal(t, completedPayment.StateVersion, after.StateVersion, "устаревшее событие не меняет состояние")
 	assert.Len(t, history, 6, fmt.Sprintf("история: %d", len(history)))
 }
 

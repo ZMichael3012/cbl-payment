@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -52,19 +53,49 @@ type CanonicalStore interface {
 
 // CanonicalConsumer переводит канонические события шлюза в переходы автомата
 // платежа. Дубли отсекает inbox (kit Processor), устаревшие события и события
-// не по порядку - доменный план (PlanEvent) и CAS по state_version.
+// не по порядку - доменный план (PlanEvent) и CAS по state_version; финальные
+// состояния completed/underpaid/overpaid определяет политика платежа (4.5).
 type CanonicalConsumer struct {
 	store    CanonicalStore
+	policy   domain.AmountPolicy
 	log      *zap.Logger
 	attempts int
+	clock    func() time.Time
 }
 
-// NewCanonicalConsumer создает CanonicalConsumer.
-func NewCanonicalConsumer(store CanonicalStore, log *zap.Logger) *CanonicalConsumer {
+// Option настраивает CanonicalConsumer.
+type Option func(*CanonicalConsumer)
+
+// WithAmountPolicy задает политику порогов подтверждений и толерансов.
+func WithAmountPolicy(policy domain.AmountPolicy) Option {
+	return func(c *CanonicalConsumer) { c.policy = policy }
+}
+
+// WithClock задает источник времени (терминальные состояния фиксируют completed_at).
+func WithClock(clock func() time.Time) Option {
+	return func(c *CanonicalConsumer) {
+		if clock != nil {
+			c.clock = clock
+		}
+	}
+}
+
+// NewCanonicalConsumer создает CanonicalConsumer с политикой по умолчанию.
+func NewCanonicalConsumer(store CanonicalStore, log *zap.Logger, opts ...Option) *CanonicalConsumer {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &CanonicalConsumer{store: store, log: log, attempts: maxConflictAttempts}
+	consumer := &CanonicalConsumer{
+		store:    store,
+		policy:   domain.DefaultAmountPolicy(),
+		log:      log,
+		attempts: maxConflictAttempts,
+		clock:    time.Now,
+	}
+	for _, opt := range opts {
+		opt(consumer)
+	}
+	return consumer
 }
 
 // Handle обрабатывает каноническое событие в транзакции Guard: проверяет вход,
@@ -119,6 +150,11 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 				zap.String("traceparent", traceparent))
 			return nil
 		}
+		if override, overrideErr := c.settlementPlan(payment, current, &event, eventType); overrideErr != nil {
+			return overrideErr
+		} else if override != nil {
+			plan = override
+		}
 
 		version := uint64(payment.StateVersion) //nolint:gosec // state_version ограничен CHECK (>= 1)
 		applied := true
@@ -127,6 +163,10 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 			if i == len(plan)-1 {
 				// Данные события фиксируются на целевом состоянии (FR-3).
 				patch = mergePatches(patch, received, canonicalPatch(&event, eventType))
+				if target == domain.StateCompleted || target == domain.StateUnderpaid || target == domain.StateOverpaid {
+					completedAt := c.clock().UTC()
+					patch.CompletedAt = &completedAt
+				}
 			}
 			updated, transitionErr := c.store.TransitionTx(ctx, tx, payment.ID, version, target, patch)
 			if errors.Is(transitionErr, domain.ErrStateConflict) {
@@ -168,6 +208,30 @@ func shortID(raw string) string {
 		return raw
 	}
 	return raw[:64] + "..."
+}
+
+// settlementPlan пересчитывает план для денежных событий по политике (4.5):
+// политика платформы главнее классификации Connector. Возвращает nil, если
+// событие не влияет на сумму (detected/failed/expired).
+func (c *CanonicalConsumer) settlementPlan(payment storage.Payment, current domain.State, event *eventsv1.CanonicalPaymentEvent, eventType domain.CanonicalEventType) ([]domain.State, error) {
+	switch eventType {
+	case domain.CanonicalConfirmed, domain.CanonicalUnderpaid, domain.CanonicalOverpaid:
+	default:
+		return nil, nil
+	}
+	received := event.GetReceivedAmount().GetMinorUnits()
+	required := c.policy.RequiredConfirmations(payment.ExpectedAsset, payment.ExpectedAmount)
+	decision := c.policy.Decide(received, payment.ExpectedAmount, int(event.GetConfirmations()), required)
+	target := domain.State(decision)
+	chain, err := domain.ChainTo(current, target)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: canonical %s settlement: %w", payment.ID, err)
+	}
+	if len(chain) == 0 {
+		// Целевое совпало с текущим: self-переход фиксирует данные события.
+		chain = []domain.State{current}
+	}
+	return chain, nil
 }
 
 // canonicalType переводит proto-enum в доменный тип; skip=true для

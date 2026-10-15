@@ -220,6 +220,58 @@ func TestIntegrationCanonicalConsumerTransactionalAtomicity(t *testing.T) {
 	assert.Zero(t, inboxRows, "inbox-строка откатилась вместе с переходами")
 }
 
+func TestIntegrationCanonicalConsumerCompletesViaPolicy(t *testing.T) {
+	db := setupConsumerDB(t)
+	repo := storage.NewRepository(db)
+	policy, err := domain.ParseAmountPolicy(`{"USDT":[{"below_minor":1000000,"confirmations":1}]}`, 0, 0)
+	require.NoError(t, err)
+	consumer := usecase.NewCanonicalConsumer(repo, zap.NewNop(), usecase.WithAmountPolicy(policy))
+	ctx := context.Background()
+
+	pendingPayment(t, repo)
+
+	confirmed := detectedEvent()
+	confirmed.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	confirmed.Confirmations = 1
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, confirmed)))
+
+	payment, history, err := repo.Get(ctx, canonicalPaymentID)
+	require.NoError(t, err)
+	assert.Equal(t, string(domain.StateCompleted), payment.State, "политика завершает платеж по порогу")
+	require.NotNil(t, payment.CompletedAt)
+	assert.Len(t, history, 6, "creating, created, pending, detected, confirming, completed")
+}
+
+func TestIntegrationCanonicalConsumerRepeatedBelowThreshold(t *testing.T) {
+	db := setupConsumerDB(t)
+	repo := storage.NewRepository(db)
+	consumer := usecase.NewCanonicalConsumer(repo, zap.NewNop())
+	ctx := context.Background()
+
+	pendingPayment(t, repo)
+
+	first := detectedEvent()
+	first.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	first.Confirmations = 2
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, first)))
+	payment, err := repo.Payment(ctx, canonicalPaymentID)
+	require.NoError(t, err)
+	assert.Equal(t, string(domain.StateConfirming), payment.State)
+	assert.Equal(t, 2, payment.Confirmations)
+
+	// Повторный confirmed ниже порога остается confirming (self-переход).
+	second := detectedEvent()
+	second.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	second.Confirmations = 4
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, second)))
+	updated, history, err := repo.Get(ctx, canonicalPaymentID)
+	require.NoError(t, err)
+	assert.Equal(t, string(domain.StateConfirming), updated.State)
+	assert.Equal(t, 4, updated.Confirmations)
+	assert.Equal(t, payment.StateVersion+1, updated.StateVersion)
+	assert.Len(t, history, int(updated.StateVersion))
+}
+
 func TestIntegrationCanonicalConsumerUnknownPayment(t *testing.T) {
 	db := setupConsumerDB(t)
 	repo := storage.NewRepository(db)
