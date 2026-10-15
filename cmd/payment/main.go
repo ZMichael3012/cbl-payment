@@ -23,6 +23,9 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
+	paymentv1 "github.com/cbl/cbl-protos/gen/go/billing/payment/v1"
+
+	"github.com/cbl/cbl-kit/grpcmw"
 	"github.com/cbl/cbl-kit/inbox"
 	"github.com/cbl/cbl-kit/inbox/kafkaconsumer"
 	"github.com/cbl/cbl-kit/outbox"
@@ -31,6 +34,7 @@ import (
 
 	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"
+	"github.com/cbl/cbl-payment/internal/transport/grpcserver"
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
@@ -192,10 +196,14 @@ func main() {
 	httpSrv := &http.Server{Addr: httpAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second}
 	metricsSrv := &http.Server{Addr: metricsAddr, Handler: metricsHandler(), ReadHeaderTimeout: 5 * time.Second}
 
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(1<<20),
+		grpc.UnaryInterceptor(grpcmw.UnaryServer(log)),
+	)
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
+	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcserver.NewPayment(usecase.NewPaymentQuery(repo)))
 	reflection.Register(grpcSrv)
 
 	grpcListener, err := net.Listen("tcp", grpcAddr)

@@ -1,14 +1,18 @@
-# E2E CBL-4.1/4.6/4.7: схема платежа, автомат состояний и фоновые задачи на compose-стенде payment.
+# E2E CBL-4.1/4.6/4.7/4.8: схема платежа, автомат состояний, фоновые задачи и
+# gRPC-чтения на compose-стенде payment.
 # Запуск из каталога сервиса: powershell -NoProfile -File test/e2e/schema.ps1
-# Сценарий: compose up -> миграции (версия 4) -> полная цепочка состояний
+# Сценарий: compose up -> миграции (версия 5) -> полная цепочка состояний
 # creating -> created -> pending -> detected -> confirming -> completed,
 # запрещенные переходы и append-only журнал отклоняются вторым барьером БД,
 # janitor истекает просроченный счет и закрывает зависшее создание,
-# переходы janitor-а уходят в outbox payment.events и публикуются relay.
+# переходы janitor-а уходят в outbox payment.events и публикуются relay,
+# gRPC GetPayment/ListPayments отдают котировку (rate, locked_until), timeline
+# и фильтры мерчанта, состояния и периода (4.8).
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $ComposeFile = Join-Path $RepoRoot "deploy\docker-compose.yml"
+$PaymentContainer = "cbl-payment-payment-1"
 
 function Invoke-Psql([string]$Sql) {
     $output = docker compose -f $ComposeFile exec -T postgres psql -U cbl -d payment -v ON_ERROR_STOP=1 -t -A -c $Sql
@@ -29,6 +33,20 @@ function Assert-PsqlFails([string]$Sql, [string]$What, [string]$ExpectedText) {
     if (($output -join "`n") -notmatch $ExpectedText) { throw "$What rejected with unexpected error: $($output -join "`n")" }
 }
 
+# Invoke-PaymentGrpcurl вызывает метод PaymentService на compose-контейнере
+# (сеть контейнера, plaintext); возвращает вывод и код выхода.
+function Invoke-PaymentGrpcurl([string]$Method, [string]$Json) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = $Json | docker run -i --rm --network "container:$PaymentContainer" fullstorydev/grpcurl:v1.9.1 -plaintext -max-time 10 -d '@' localhost:9030 "billing.payment.v1.PaymentService/$Method" 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return @{ Output = ($output -join "`n"); Code = $code }
+}
+
 Push-Location $RepoRoot
 try {
     # Чистый стенд: остатки прошлого запуска приводят к конфликту имен.
@@ -40,7 +58,7 @@ try {
     foreach ($attempt in 1..30) {
         try {
             $version = Invoke-Psql "SELECT max(version_id) FROM goose_db_version"
-            if ($version -eq "4") { $migrated = $true; break }
+            if ($version -eq "5") { $migrated = $true; break }
         } catch {
             Start-Sleep -Seconds 2
         }
@@ -56,8 +74,9 @@ try {
     Invoke-Psql "INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version, reason) VALUES ('$paymentId', '', 'creating', 1, 'created')" | Out-Null
 
     # Полная цепочка автомата; каждая версия получает строку журнала.
+    # Котировка (4.8) фиксируется на шаге creating -> created (fill-once).
     $chain = @(
-        @{ From = "creating"; To = "created"; Version = 2; Extra = "" },
+        @{ From = "creating"; To = "created"; Version = 2; Extra = ", quote_id = 'q-e2e', rate = '78.125', quote_locked_until = now() + interval '15 minutes'" },
         @{ From = "created"; To = "pending"; Version = 3; Extra = "" },
         @{ From = "pending"; To = "detected"; Version = 4; Extra = ", txid = 'tx-e2e', received_amount = 1000, received_asset = 'USDT', received_decimals = 2" },
         @{ From = "detected"; To = "confirming"; Version = 5; Extra = ", confirmations = 1" },
@@ -146,7 +165,35 @@ INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version
     }
     if (-not $published) { throw "relay did not publish outbox rows (pending=$unpublished)" }
 
-    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected, janitor expired+creating_failed+detected intact, outbox expired+failed published"
+    # gRPC-чтения (4.8): GetPayment отдает rate/locked_until и полный timeline;
+    # ListPayments фильтрует по мерчанту, состоянию и периоду.
+    $get = Invoke-PaymentGrpcurl "GetPayment" "{`"paymentId`":`"$paymentId`"}"
+    if ($get.Code -ne 0) { throw "GetPayment failed: $($get.Output)" }
+    $getJson = $get.Output | ConvertFrom-Json
+    if ($getJson.payment.rate -ne "78.125") { throw "GetPayment rate mismatch: $($get.Output)" }
+    if (-not $getJson.payment.lockedUntil) { throw "GetPayment lockedUntil is empty: $($get.Output)" }
+    if ($getJson.payment.txid -ne "tx-e2e") { throw "GetPayment txid mismatch: $($get.Output)" }
+    if ($getJson.payment.confirmations -ne 6) { throw "GetPayment confirmations mismatch: $($get.Output)" }
+    if ($getJson.payment.timeline.Count -ne 6) { throw "GetPayment timeline mismatch: $($get.Output)" }
+
+    $list = Invoke-PaymentGrpcurl "ListPayments" "{`"merchantId`":`"m-e2e`",`"stateFilter`":`"PAYMENT_STATE_COMPLETED`"}"
+    if ($list.Code -ne 0) { throw "ListPayments failed: $($list.Output)" }
+    $listJson = $list.Output | ConvertFrom-Json
+    if ($listJson.payments.Count -ne 1 -or $listJson.payments[0].paymentId -ne $paymentId) {
+        throw "ListPayments completed mismatch: $($list.Output)"
+    }
+
+    $future = Invoke-PaymentGrpcurl "ListPayments" "{`"merchantId`":`"m-e2e`",`"createdFrom`":`"2100-01-01T00:00:00Z`"}"
+    if ($future.Code -ne 0) { throw "ListPayments future period failed: $($future.Output)" }
+    $futureJson = $future.Output | ConvertFrom-Json
+    if ($futureJson.payments) { throw "ListPayments future period must be empty: $($future.Output)" }
+
+    $missing = Invoke-PaymentGrpcurl "GetPayment" "{`"paymentId`":`"$([guid]::NewGuid())`"}"
+    if ($missing.Code -eq 0 -or $missing.Output -notmatch "NotFound") {
+        throw "GetPayment unknown must return NotFound: $($missing.Output)"
+    }
+
+    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected, janitor expired+creating_failed+detected intact, outbox expired+failed published, read API rate/locked_until/list filters green"
 } finally {
     docker compose -f $ComposeFile --profile app down -v | Out-Null
     Pop-Location

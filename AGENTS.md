@@ -16,12 +16,14 @@ Out of scope: другие сервисы платформы; взаимодей
 ## 2. Контракты
 
 - REST: административный /healthz, /readyz
-- gRPC: сервер PaymentService; клиент ConnectorService, QuoteService
+- gRPC: сервер PaymentService (GetPayment/ListPayments - 4.8; CreatePayment,
+  CancelPayment - 4.2, KI-01); клиент ConnectorService, QuoteService
 - Kafka продюсирует: payment.events (через outbox, 4.7)
 - Kafka потребляет: gateway.events.canonical (группа `cbl-payment-canonical`)
 - Хранилище: PostgreSQL payment
 
-Контракты заморожены в `cbl-protos` (CF-1 для gRPC, CF-2/CF-3 для событий), см. `CBL-004`.
+Контракты заморожены в `cbl-protos` (CF-1 gRPC, CF-2/CF-3 события; поля
+котировки и чтений - `cbl-protos@cf-3.3`/`cf-3.4`, CBL-4.8), см. `CBL-004`.
 
 ## 3. Архитектура
 
@@ -41,6 +43,12 @@ goose, zap). `AutoMigrate` запрещен, миграции только goose
 конверт `payment.events` в `outbox` в той же транзакции (sink -
 `internal/usecase/payment_events.go`); relay kit в `main` публикует при заданном
 `KAFKA_BROKERS` (batch 100, интервал 250 мс), без Kafka события накапливаются.
+Чтения (4.8): `internal/usecase/payment_query.go` (PaymentQuery) и
+`internal/transport/grpcserver/payment.go` (GetPayment/ListPayments); миграция
+00005 добавляет `quote_locked_until` и правило fill-once для полей котировки
+(`quote_id`, `rate`, `quote_locked_until`) в триггере перехода; история Get
+ограничена последними 500 переходами; gRPC-сервер собирается в `main` с
+`grpcmw.UnaryServer`.
 
 ## 4. Команды
 
@@ -101,6 +109,7 @@ consumer lag; дашборды после задачи 0.7.
 | T-PAY-05 | Политика платформы (4.5) главнее классификации Connector: недоплата/переплата в пределах толеранса завершается `completed`, сверх - терминальные состояния; пороги задаются оператором в единицах актива | бизнес-решение о деньгах в одном месте (Payment), конфигурируемые пороги без релиза | двойная классификация (шлюз и платформа), расхождение с Reconciler, дрейф USD-эквивалента при ручной настройке | сверка 9.x обязана учитывать толерансы (status_mismatch не для разницы в пределах толеранса); USD-feed и fee - KI-payment-06 |
 | T-PAY-06 | Janitor в процессе сервиса (4.6): тикер, пакетные выборки по частичным индексам, CAS-переходы; без отдельного deployment-а и leader election | нет нового сервиса и его эксплуатации; работает без Kafka; выключается env-ом; несколько реплик безопасны (CAS дает один эффект) | лишние конфликты и дублирование выборок у реплик (jitter не введен осознанно); пакет последователен - долгий row-lock задерживает проход (следующий тик доводит остаток); отмена контекста обрывает проход между платежами | наблюдаемость через логи janitor (метрики - 0.7); порог риска по нагрузке - 14.6; координация реплик не требуется для корректности |
 | T-PAY-07 | События payment.events через transactional outbox (4.7): эмиссия в `Repository.TransitionTx` (та же транзакция, что переход и inbox Guard), relay kit в процессе сервиса (FOR UPDATE SKIP LOCKED, batch 100, 250 мс, публикация внутри транзакции БД - kit T-KK5) | нет потери событий при сбоях (БД-транзакция первична), Kafka не в критическом пути, at-least-once, дубли дедуплицируются `event_id` и мониторингом `state_version` (самопереходы публикуются) | при нескольких репликах порядок событий между транзакциями не гарантирован (потребители отбрасывают устаревшие `state_version`); нет топика/брокера - строки копятся, relay повторяет (WARN при старте без Kafka); GORM-логирование значений SQL - общий вопрос 0.7 | ретеншен outbox - 14.2 (KI-payment-02); метрики outbox lag - 0.7; эмиссия проверена unit/integration/e2e (Kafka), сбой sink откатывает переход |
+| T-PAY-08 | Чтения (4.8) без authN: ListPayments доверяет `merchant_id` из тела, GetPayment отдает платеж по UUID; владелец проверяется вызывающим (7.4 берет мерчанта из токена), история Get ограничена 500 переходами | BFF получает счета и timeline без межсервисной БД; ограниченный ответ не зависит от длительности жизни платежа | подмена `merchant_id`/UUID не ловится до mTLS (0.6, KI-payment-04): порт 9030 не публикуется вне доверенной сети, prod запрещен; self-transition confirmations раздувают журнал - полная история 14.2 | KI-payment-04 расширен gRPC-поверхностью; e2e фильтры и границы проверены; pagination списка клампится (50/200) |
 
 ## 9. Known issues
 
@@ -109,7 +118,7 @@ consumer lag; дашборды после задачи 0.7.
 | KI-payment-01 | CI и pre-commit не настроены | линтеры запускаются вручную | задача 0.2 | open |
 | KI-payment-02 | Нет ротации и партиционирования `payments`, `payment_transitions`, `outbox`: таблицы растут бессрочно (outbox - строка на каждый переход, 4.7) | рост БД и бэкапов; чтения по PK/индексам не страдают | ретеншен/партиционирование - задача 14.2 (как KI-ledger-09); до этого чистить published-строки вручную не разрешается (аудит) | open |
 | KI-payment-03 | Рантайм и миграции работают под одним DSN: владелец схемы может снять триггеры второго барьера (`DISABLE TRIGGER`, `session_replication_role`, `DROP TRIGGER`) | в dev-контуре второй барьер снимается владельцем БД; формально T-PAY-01 гарантирует защиту только от DML-ролей | разделить роли migrator (DDL) и runtime (DML без DDL) при выходе в prod (0.4/0.6); вне модели угроз dev-стенда | open |
-| KI-payment-04 | Топики `gateway.events.canonical` и `payment.events` не аутентифицированы: участник с produce-правами в canonical переводит платеж в detected/confirming и (с 4.5) в терминальные, а с 4.7 подтвержденный платеж публикует `payment.completed`, который Ledger 2.7 идемпотентно проводит реальными деньгами (Dr clearing / Cr merchant) без сверки со шлюзом; подделка `payment.events` напрямую подделывает проводку (кросс-ссылка KI-ledger-02) | утечка produce-доступа = завершение произвольных платежей и движение денег; исправление уже проведенных - только сторно (10.x), не replay события | broker ACL и mTLS: produce в canonical только Connector, в `payment.events` только cbl-payment (0.5/0.6); prod-выкладка запрещена до этого; перепроверка перед завершением - 4.4 (после KI-01); разбор подозрительного `payment.completed` - runbook | open |
+| KI-payment-04 | Топики `gateway.events.canonical` и `payment.events` не аутентифицированы: участник с produce-правами в canonical переводит платеж в detected/confirming и (с 4.5) в терминальные, а с 4.7 подтвержденный платеж публикует `payment.completed`, который Ledger 2.7 идемпотентно проводит реальными деньгами (Dr clearing / Cr merchant) без сверки со шлюзом; подделка `payment.events` напрямую подделывает проводку (кросс-ссылка KI-ledger-02). С 4.8 gRPC-чтения (9030) без authN: `ListPayments` отдает платежи любого `merchant_id` из тела, `GetPayment` - любой платеж по UUID (pay_address, txid, суммы, timeline), reflection раскрывает каталог методов | утечка produce-доступа = завершение произвольных платежей и движение денег; доступ к порту 9030 = выписка чужих адресов депозита и сумм; исправление уже проведенных - только сторно (10.x), не replay события | broker ACL и mTLS: produce в canonical только Connector, в `payment.events` только cbl-payment (0.5/0.6); gRPC mTLS и проверка владельца (7.4 берет мерчанта из токена, Get - ownership в 7.4) до mTLS 0.6; порт 9030 не публиковать вне доверенной сети, reflection отключить в prod; prod-выкладка запрещена до этого; перепроверка перед завершением - 4.4 (после KI-01); разбор подозрительного `payment.completed` - runbook | open |
 | KI-payment-05 | Too-early события опираются на номинальные retry-паузы 5s/1m/10m: с 4.6 зависшее создание закрывается `failed` через 5 минут, поэтому событие для него становится stale, а не бесконечным повтором; остаточный риск - платеж в `created` дольше ~11 минут (до реализации 4.2/4.4) уводит валидное событие в DLQ | задержка подтверждения до ручного replay | parking/replay DLQ в runbook; пересмотр бюджетов ретраев вместе с 4.2; наблюдение за `created` без движения - кандидат в 9.x | open |
 | KI-payment-06 | `fee` платежа NULL (трактуется как 0 - правила комиссии не определены, кандидат Billing API 7.x); пороги подтверждений настраиваются вручную без USD-эквивалента (feed из Quote 6.x не подключен) | недосбор комиссии; дрейф порогов при движении курса требует ручного пересмотра | правила комиссии - в 7.x; автоматический пересчет ярусов - при появлении требований бухгалтерии/14.x | open |
 | KI-payment-07 | Монотонность по `gateway_event_ts` не реализована (делегировалась 3.5/T-CONNECTOR-05): устаревшее событие из retry-контура может регрессировать `confirmations` или терминализировать платеж после более нового | редкие ложные терминальные статусы/откат счетчика до ручного разбора | сравнение времени события при хранении `gateway_event_ts` (4.x) либо перепроверка статуса 4.4 после KI-01 | open |
@@ -124,7 +133,8 @@ consumer lag; дашборды после задачи 0.7.
 | CBL-4.3 | 2026-10-15 | done, ревью закрыто (consumer канонических событий в транзакции Guard, план событий с защитой от дублей и порядка, e2e Kafka) | `.specs/CBL-4.3-canonical-consumer.md` | 2d5f263 |
 | CBL-4.5 | 2026-10-15 | done, ревью закрыто (политика порогов по активу и сумме, толерансы без float, авто-завершение из consumer-а, e2e) | `.specs/CBL-4.5-confirmation-policy.md` | 0a9d627 |
 | CBL-4.6 | 2026-10-15 | done, ревью закрыто (janitor: истечение счетов, зависшие создания в failed, наблюдение за detected/confirming, пакетные выборки на частичных индексах, e2e) | `.specs/CBL-4.6-background-janitor.md` | ccb2d79 |
-| CBL-4.7 | 2026-10-15 | done, ревью закрыто (payment.events через outbox: эмиссия в TransitionTx, конверты CF-2, relay в main, traceparent-цепочка, e2e Kafka) | `.specs/CBL-4.7-payment-events-outbox.md` | этот коммит |
+| CBL-4.7 | 2026-10-15 | done, ревью закрыто (payment.events через outbox: эмиссия в TransitionTx, конверты CF-2, relay в main, traceparent-цепочка, e2e Kafka) | `.specs/CBL-4.7-payment-events-outbox.md` | eee1780 |
+| CBL-4.8 | 2026-10-15 | done, ревью закрыто (gRPC-чтения: GetPayment с котировкой/txid/confirmations/timeline, ListPayments с мерчантом, состоянием и периодом; миграция 00005 fill-once; cap timeline 500; контракты cf-3.3/cf-3.4) | `.specs/CBL-4.8-invoice-read-api.md` | этот коммит |
 
 ## 11. Runbook
 
@@ -208,3 +218,19 @@ Kafka consumer group и outbox lag, при необходимости перез
    канонического события/платежа до проводки; если проводка уже прошла -
    исправление только сторно (10.x), не повтор события; инцидент - с разбором
    produce-доступа к топикам.
+
+Чтения (4.8):
+
+1. `payment_not_found` (NotFound) на GetPayment: UUID корректен, но платежа нет
+   (или он еще не создан 4.2 - CreatePayment недоступен до KI-01).
+2. `invalid_query`/`invalid_period`/`invalid_cursor` (InvalidArgument):
+   пустой/длинный `merchant_id`, неизвестный `state_filter`, границы периода
+   (to не позже from, метка вне диапазона protobuf), курсор не из
+   `next_cursor`.
+3. Пустой список ListPayments - норма для чужого/неизвестного мерчанта
+   (сравнение с ожидаемым `merchant_id` из токена - обязанность 7.4).
+4. GetPayment отдает последние 500 переходов: усеченный timeline на
+   долгоживущем нетерминальном платеже - ожидаемо (полная история - 14.2;
+   рост журнала от self-transition confirmations - KI-payment-07).
+5. Прямой доступ к 9030 вне доверенной сети запрещен (KI-payment-04): выписка
+   чужого мерчанта подменой `merchant_id`; mTLS/ownership - 7.4, 0.6.

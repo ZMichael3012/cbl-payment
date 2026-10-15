@@ -23,12 +23,17 @@ var (
 	ErrNotFound = errors.New("payment: payment not found")
 	// ErrDuplicateKey сообщает о занятом ключе идемпотентности мерчанта.
 	ErrDuplicateKey = errors.New("payment: idempotency key already used")
+	// ErrInvalidCursor сообщает о некорректном курсоре списка платежей.
+	ErrInvalidCursor = errors.New("payment: invalid cursor")
 )
 
-// Границы пагинации списка платежей.
+// Границы пагинации списка платежей и истории переходов: Get возвращает
+// последние maxTimelineTransitions записей журнала - защита от неограниченного
+// ответа при долгой жизни нетерминального платежа (self-transition confirmations).
 const (
-	defaultListLimit = 50
-	maxListLimit     = 200
+	defaultListLimit       = 50
+	maxListLimit           = 200
+	maxTimelineTransitions = 500
 )
 
 // Границы пакетов фоновых выборок (janitor 4.6): отдельный, более высокий
@@ -72,6 +77,8 @@ type Payment struct {
 	QuoteID *string `gorm:"column:quote_id"`
 	// Rate задает зафиксированный курс десятичной строкой.
 	Rate *string `gorm:"column:rate"`
+	// QuoteLockedUntil задает срок фиксации котировки (заполняется один раз, 4.8).
+	QuoteLockedUntil *time.Time `gorm:"column:quote_locked_until"`
 	// PayAddress задает адрес оплаты в шлюзе.
 	PayAddress *string `gorm:"column:pay_address"`
 	// Network задает сеть оплаты.
@@ -137,6 +144,8 @@ type TransitionPatch struct {
 	QuoteID *string
 	// Rate задает зафиксированный курс.
 	Rate *string
+	// QuoteLockedUntil задает срок фиксации котировки (fill-once, 4.8).
+	QuoteLockedUntil *time.Time
 	// PayAddress задает адрес оплаты.
 	PayAddress *string
 	// GatewayID задает идентификатор платежа в шлюзе.
@@ -163,6 +172,10 @@ type ListFilter struct {
 	MerchantID string
 	// State задает необязательный фильтр состояния.
 	State *domain.State
+	// CreatedFrom задает нижнюю границу периода создания включительно (4.8).
+	CreatedFrom *time.Time
+	// CreatedTo задает верхнюю границу периода создания исключительно (4.8).
+	CreatedTo *time.Time
 	// Limit задает размер страницы (1 - 200, по умолчанию 50).
 	Limit int
 	// Cursor задает курсор предыдущей страницы.
@@ -296,9 +309,11 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 	return updated, nil
 }
 
-// Get возвращает платеж и его историю переходов по возрастанию версии.
-// Обе выборки выполняются в одной read-only транзакции repeatable read:
-// конкурентный переход не должен вернуть timeline новее самого платежа.
+// Get возвращает платеж и его историю переходов по возрастанию версии; история
+// ограничена последними maxTimelineTransitions записями (защита от
+// неограниченного ответа, полная история - 14.2). Обе выборки выполняются в
+// одной read-only транзакции repeatable read: конкурентный переход не должен
+// вернуть timeline новее самого платежа.
 func (r *Repository) Get(ctx context.Context, id string) (Payment, []Transition, error) {
 	var payment Payment
 	var history []Transition
@@ -306,15 +321,23 @@ func (r *Repository) Get(ctx context.Context, id string) (Payment, []Transition,
 		if findErr := tx.Where("id = ?", id).First(&payment).Error; findErr != nil {
 			return findErr
 		}
-		return tx.Where("payment_id = ?", id).
-			Order("state_version ASC").
-			Find(&history).Error
+		if historyErr := tx.Where("payment_id = ?", id).
+			Order("state_version DESC").
+			Limit(maxTimelineTransitions).
+			Find(&history).Error; historyErr != nil {
+			return historyErr
+		}
+		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Payment{}, nil, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	if err != nil {
 		return Payment{}, nil, fmt.Errorf("storage: get payment %s: %w", id, err)
+	}
+	// Журнал читался от новых к старым (LIMIT последних); наружу - по возрастанию.
+	for left, right := 0, len(history)-1; left < right; left, right = left+1, right-1 {
+		history[left], history[right] = history[right], history[left]
 	}
 	return payment, history, nil
 }
@@ -357,6 +380,12 @@ func (r *Repository) List(ctx context.Context, filter ListFilter) ([]Payment, st
 	query := r.db.WithContext(ctx).Where("merchant_id = ?", filter.MerchantID)
 	if filter.State != nil {
 		query = query.Where("state = ?", string(*filter.State))
+	}
+	if filter.CreatedFrom != nil {
+		query = query.Where("created_at >= ?", filter.CreatedFrom.UTC())
+	}
+	if filter.CreatedTo != nil {
+		query = query.Where("created_at < ?", filter.CreatedTo.UTC())
 	}
 	if strings.TrimSpace(filter.Cursor) != "" {
 		createdAt, id, err := decodeCursor(filter.Cursor)
@@ -458,6 +487,9 @@ func (p TransitionPatch) updates() map[string]any {
 	if p.Rate != nil {
 		updates["rate"] = *p.Rate
 	}
+	if p.QuoteLockedUntil != nil {
+		updates["quote_locked_until"] = *p.QuoteLockedUntil
+	}
 	if p.PayAddress != nil {
 		updates["pay_address"] = *p.PayAddress
 	}
@@ -495,20 +527,21 @@ func encodeCursor(createdAt time.Time, id string) string {
 func decodeCursor(cursor string) (time.Time, string, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return time.Time{}, "", fmt.Errorf("storage: invalid cursor: %w", err)
+		return time.Time{}, "", fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 	}
 	createdAtRaw, id, found := strings.Cut(string(raw), "|")
 	if !found || id == "" {
-		return time.Time{}, "", errors.New("storage: invalid cursor")
+		return time.Time{}, "", ErrInvalidCursor
 	}
 	createdAt, err := time.Parse(time.RFC3339Nano, createdAtRaw)
 	if err != nil {
-		return time.Time{}, "", fmt.Errorf("storage: invalid cursor time: %w", err)
+		return time.Time{}, "", fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 	}
-	if _, err := uuid.Parse(id); err != nil {
-		return time.Time{}, "", errors.New("storage: invalid cursor id")
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return time.Time{}, "", ErrInvalidCursor
 	}
-	return createdAt.UTC(), id, nil
+	return createdAt.UTC(), parsed.String(), nil
 }
 
 // isUniqueViolation сообщает, что ошибка БД - занятый ключ идемпотентности
