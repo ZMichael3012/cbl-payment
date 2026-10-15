@@ -90,6 +90,7 @@ func setupE2EKafka(t *testing.T) []string {
 	topics := []string{
 		topic, topic + inbox.RetrySuffix5s, topic + inbox.RetrySuffix1m,
 		topic + inbox.RetrySuffix10m, topic + inbox.DLQSuffix,
+		usecase.TopicPaymentEvents,
 	}
 	for _, name := range topics {
 		_, err := admin.CreateTopic(ctx, 1, 1, nil, name)
@@ -149,7 +150,7 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	repo := storage.NewRepository(db)
+	repo := storage.NewRepository(db, storage.WithEventSink(usecase.NewPaymentEventSink(zap.NewNop())))
 	payment := storage.Payment{
 		ID:               canonicalE2EPaymentID,
 		MerchantID:       "m-e2e",
@@ -169,6 +170,9 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	publisher, err := kafkapub.New(brokers)
 	require.NoError(t, err)
 	defer publisher.Close()
+
+	relay := outbox.NewRelay(db, publisher, zap.NewNop(), outbox.WithInterval(50*time.Millisecond))
+	go func() { _ = relay.Run(ctx) }()
 
 	policy, err := domain.ParseAmountPolicy(`{"USDT":[{"below_minor":1000000,"confirmations":1}]}`, 0, 0)
 	require.NoError(t, err)
@@ -214,6 +218,75 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	assert.Equal(t, string(domain.StateCompleted), after.State)
 	assert.Equal(t, completedPayment.StateVersion, after.StateVersion, "устаревшее событие не меняет состояние")
 	assert.Len(t, history, 6, fmt.Sprintf("история: %d", len(history)))
+
+	// 4.7: переходы породили ровно четыре события (created, detected,
+	// confirming, completed); дубликат и устаревшее событие - без эффекта.
+	var outboxCount int64
+	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)
+	require.Equal(t, int64(4), outboxCount)
+
+	consumed := consumePaymentEvents(t, ctx, brokers, 4)
+	byType := make(map[string]kgo.Record, len(consumed))
+	for _, record := range consumed {
+		byType[string(recordHeader(record, outbox.HeaderEventType))] = record
+	}
+	wantVersions := map[string]uint64{
+		"payment.created": 2, "payment.detected": 4, "payment.confirming": 5, "payment.completed": 6,
+	}
+	require.Len(t, byType, 4, "ровно четыре типа событий: дубликат и устаревшее события не породили")
+	for eventType, record := range byType {
+		assert.Equal(t, usecase.ProducerPayment, string(recordHeader(record, outbox.HeaderProducer)))
+		assert.Equal(t, usecase.SchemaVersion, string(recordHeader(record, outbox.HeaderSchemaVersion)))
+		assert.Equal(t, canonicalE2EPaymentID, string(record.Key))
+
+		var payload eventsv1.PaymentEvent
+		require.NoError(t, proto.Unmarshal(record.Value, &payload))
+		assert.Equal(t, wantVersions[eventType], payload.GetStateVersion())
+		assert.Equal(t, canonicalE2EPaymentID, payload.GetPaymentId())
+		assert.Equal(t, "m-e2e", payload.GetMerchantId())
+		assert.Equal(t, string(recordHeader(record, outbox.HeaderOccurredAt)),
+			payload.GetOccurredAt().AsTime().UTC().Format(time.RFC3339Nano),
+			"заголовок occurred_at зеркалит тело")
+	}
+	var completed eventsv1.PaymentEvent
+	require.NoError(t, proto.Unmarshal(byType["payment.completed"].Value, &completed))
+	assert.Equal(t, int64(100_000), completed.GetReceivedAmount().GetMinorUnits())
+	assert.Equal(t, "tx-e2e", completed.GetTxid())
+}
+
+// recordHeader возвращает значение заголовка Kafka-записи.
+func recordHeader(record kgo.Record, key string) []byte {
+	for _, header := range record.Headers {
+		if header.Key == key {
+			return header.Value
+		}
+	}
+	return nil
+}
+
+// consumePaymentEvents читает payment.events с начала топика до want записей.
+func consumePaymentEvents(t *testing.T, ctx context.Context, brokers []string, want int) []kgo.Record {
+	t.Helper()
+	consumer, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(usecase.TopicPaymentEvents),
+		kgo.ConsumerGroup("e2e-payment-events-"+uuid.Must(uuid.NewV7()).String()),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	require.NoError(t, err)
+	defer consumer.Close()
+
+	var records []kgo.Record
+	for len(records) < want {
+		fetches := consumer.PollFetches(ctx)
+		if err := fetches.Err(); err != nil {
+			require.FailNow(t, "poll payment.events failed", err.Error(), fmt.Sprintf("got %d of %d", len(records), want))
+		}
+		fetches.EachRecord(func(record *kgo.Record) {
+			records = append(records, *record)
+		})
+	}
+	return records
 }
 
 // waitForInboxCount ждет появления ожидаемого числа inbox-строк: маркер того,

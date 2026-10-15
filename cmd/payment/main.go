@@ -25,6 +25,7 @@ import (
 
 	"github.com/cbl/cbl-kit/inbox"
 	"github.com/cbl/cbl-kit/inbox/kafkaconsumer"
+	"github.com/cbl/cbl-kit/outbox"
 	"github.com/cbl/cbl-kit/outbox/kafkapub"
 	"github.com/cbl/cbl-kit/storagex"
 
@@ -79,7 +80,7 @@ func main() {
 		return
 	}
 
-	repo := storage.NewRepository(db)
+	repo := storage.NewRepository(db, storage.WithEventSink(usecase.NewPaymentEventSink(log)))
 	underBPS, bpsErr := parseToleranceBPS(os.Getenv("PAYMENT_UNDERPAID_TOLERANCE_BPS"))
 	if bpsErr != nil {
 		log.Error("parse PAYMENT_UNDERPAID_TOLERANCE_BPS failed", zap.Error(bpsErr))
@@ -146,6 +147,13 @@ func main() {
 		}
 		defer publisher.Close()
 
+		relay := outbox.NewRelay(db, publisher, log)
+		go func() {
+			if runErr := relay.Run(ctx); runErr != nil && !errors.Is(runErr, context.Canceled) {
+				log.Error("outbox relay stopped", zap.Error(runErr))
+			}
+		}()
+
 		group := getenv("KAFKA_CONSUMER_GROUP", usecase.ConsumerGroupCanonical)
 		consumer := usecase.NewCanonicalConsumer(repo, log, usecase.WithAmountPolicy(policy))
 		processor := inbox.NewProcessor(group, db, inbox.NewGuard(), consumer, publisher,
@@ -169,7 +177,7 @@ func main() {
 		}()
 		log.Info("canonical consumer started", zap.String("group", group))
 	} else {
-		log.Warn("KAFKA_BROKERS is empty: canonical consumer disabled")
+		log.Warn("KAFKA_BROKERS is empty: canonical consumer and outbox relay disabled, payment events accumulate in outbox")
 	}
 
 	router := gin.New()

@@ -102,6 +102,9 @@ func NewCanonicalConsumer(store CanonicalStore, log *zap.Logger, opts ...Option)
 // строит план переходов и применяет его с повторами при конфликте версии.
 func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.Message) error {
 	traceparent := msg.Headers[outbox.HeaderTraceparent]
+	// Трассировка источника переносится в контекст: событие payment.events
+	// наследует traceparent канонического события (4.7).
+	ctx = storage.WithTraceparent(ctx, traceparent)
 	var event eventsv1.CanonicalPaymentEvent
 	if err := proto.Unmarshal(msg.Value, &event); err != nil {
 		return fmt.Errorf("%w: unmarshal: %w", errInvalidCanonicalEvent, err)
@@ -111,7 +114,7 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 		c.log.Warn("canonical event without known type skipped",
 			zap.String("payment_id", shortID(event.GetPaymentId())),
 			zap.String("type", event.GetType().String()),
-			zap.String("traceparent", traceparent),
+			zap.String("traceparent", shortID(traceparent)),
 		)
 		return nil
 	}
@@ -154,14 +157,14 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 					zap.String("type", string(eventType)),
 					zap.String("state", string(current)),
 					zap.Int64("state_version", payment.StateVersion),
-					zap.String("traceparent", traceparent))
+					zap.String("traceparent", shortID(traceparent)))
 				return nil
 			}
 			c.log.Warn("stale canonical event skipped",
 				zap.String("payment_id", payment.ID),
 				zap.String("type", string(eventType)),
 				zap.String("state", string(current)),
-				zap.String("traceparent", traceparent))
+				zap.String("traceparent", shortID(traceparent)))
 			return nil
 		}
 		if override, overrideErr := c.settlementPlan(payment, current, &event, eventType); overrideErr != nil {
@@ -199,7 +202,7 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 				zap.String("state", string(plan[len(plan)-1])),
 				zap.Uint64("state_version", version),
 				zap.Bool("conflict_retry", attempt > 0),
-				zap.String("traceparent", traceparent))
+				zap.String("traceparent", shortID(traceparent)))
 			return nil
 		}
 	}

@@ -1,9 +1,10 @@
-# E2E CBL-4.1/4.6: схема платежа, автомат состояний и фоновые задачи на compose-стенде payment.
+# E2E CBL-4.1/4.6/4.7: схема платежа, автомат состояний и фоновые задачи на compose-стенде payment.
 # Запуск из каталога сервиса: powershell -NoProfile -File test/e2e/schema.ps1
 # Сценарий: compose up -> миграции (версия 4) -> полная цепочка состояний
 # creating -> created -> pending -> detected -> confirming -> completed,
 # запрещенные переходы и append-only журнал отклоняются вторым барьером БД,
-# janitor истекает просроченный счет, закрывает зависшее создание и не трогает detected.
+# janitor истекает просроченный счет и закрывает зависшее создание,
+# переходы janitor-а уходят в outbox payment.events и публикуются relay.
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -45,6 +46,10 @@ try {
         }
     }
     if (-not $migrated) { throw "payment migrations are not applied (version $version)" }
+
+    # Топик payment.events для relay: в compose авто-создание топиков выключено.
+    docker compose -f $ComposeFile exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic payment.events --partitions 1 --replication-factor 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "payment.events topic creation failed" }
 
     $paymentId = [guid]::NewGuid().ToString()
     Invoke-Psql "INSERT INTO payments (id, merchant_id, idempotency_key, request_hash, state, expected_amount, expected_asset, expected_decimals, network) VALUES ('$paymentId', 'm-e2e', 'key-e2e', 'hash-e2e', 'creating', 1000, 'USDT', 2, 'trc20')" | Out-Null
@@ -126,7 +131,22 @@ INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version
     $detectedState = Invoke-Psql "SELECT state || ':' || state_version FROM payments WHERE id = '$detectedId'"
     if ($detectedState -ne "detected:4") { throw "janitor must not touch detected payment: $detectedState" }
 
-    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected, janitor expired+creating_failed+detected intact"
+    # Outbox (4.7): переходы janitor-а породили события payment.expired/payment.failed,
+    # relay публикует их в Kafka (топик создан выше; строки идут через outbox).
+    $expiredEvents = Invoke-Psql "SELECT count(*) FROM outbox WHERE topic = 'payment.events' AND `"key`" = '$expiredId' AND headers->>'event_type' = 'payment.expired'"
+    if ($expiredEvents -ne "1") { throw "expected one payment.expired outbox row: $expiredEvents" }
+    $failedEvents = Invoke-Psql "SELECT count(*) FROM outbox WHERE topic = 'payment.events' AND `"key`" = '$stuckCreateId' AND headers->>'event_type' = 'payment.failed'"
+    if ($failedEvents -ne "1") { throw "expected one payment.failed outbox row: $failedEvents" }
+
+    $published = $false
+    foreach ($attempt in 1..15) {
+        $unpublished = Invoke-Psql "SELECT count(*) FROM outbox WHERE published_at IS NULL"
+        if ($unpublished -eq "0") { $published = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $published) { throw "relay did not publish outbox rows (pending=$unpublished)" }
+
+    Write-Host "OK: migrations=$version, chain=completed:6, history=6, forbidden transition and rewrite rejected, janitor expired+creating_failed+detected intact, outbox expired+failed published"
 } finally {
     docker compose -f $ComposeFile --profile app down -v | Out-Null
     Pop-Location

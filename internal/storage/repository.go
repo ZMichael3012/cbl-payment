@@ -171,12 +171,20 @@ type ListFilter struct {
 
 // Repository читает и изменяет платежи в PostgreSQL.
 type Repository struct {
-	db *gorm.DB
+	db        *gorm.DB
+	eventSink TransitionEventSink
 }
 
+// Option настраивает Repository.
+type Option func(*Repository)
+
 // NewRepository создает Repository.
-func NewRepository(db *gorm.DB) *Repository {
-	return &Repository{db: db}
+func NewRepository(db *gorm.DB, opts ...Option) *Repository {
+	repo := &Repository{db: db}
+	for _, opt := range opts {
+		opt(repo)
+	}
+	return repo
 }
 
 // Create создает платеж в состоянии creating и записывает переход версии 1
@@ -272,7 +280,15 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 		if createErr := tx.Create(&history).Error; createErr != nil {
 			return createErr
 		}
-		return tx.Where("id = ?", id).First(&updated).Error
+		if loadErr := tx.Where("id = ?", id).First(&updated).Error; loadErr != nil {
+			return loadErr
+		}
+		return r.emitTransitionEvent(ctx, tx, TransitionEvent{
+			Payment:    updated,
+			From:       from,
+			To:         to,
+			OccurredAt: history.OccurredAt,
+		})
 	})
 	if err != nil {
 		return Payment{}, fmt.Errorf("storage: transition payment %s: %w", id, err)
