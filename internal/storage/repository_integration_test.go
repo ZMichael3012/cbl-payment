@@ -27,7 +27,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/storage"
 )
 
-// allStates задает канонические состояния автомата для перебора матрицы.
+// allStates holds the canonical state machine states for matrix enumeration.
 var allStates = []domain.State{
 	domain.StateCreating,
 	domain.StateCreated,
@@ -67,7 +67,7 @@ func setupPaymentDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// newPayment возвращает валидный платеж в состоянии создания.
+// newPayment returns a valid payment in the creation state.
 func newPayment(t *testing.T, key string) storage.Payment {
 	t.Helper()
 	id, err := uuid.NewV7()
@@ -84,7 +84,7 @@ func newPayment(t *testing.T, key string) storage.Payment {
 	}
 }
 
-// transition выполняет переход и возвращает обновленный платеж.
+// transition performs a transition and returns the updated payment.
 func transition(t *testing.T, repo *storage.Repository, id string, version uint64, to domain.State, patch storage.TransitionPatch) storage.Payment {
 	t.Helper()
 	payment, err := repo.Transition(context.Background(), id, version, to, patch)
@@ -92,7 +92,7 @@ func transition(t *testing.T, repo *storage.Repository, id string, version uint6
 	return payment
 }
 
-// paymentAtState доводит новый платеж до состояния chain.
+// paymentAtState brings a new payment through the chain of states.
 func paymentAtState(t *testing.T, repo *storage.Repository, key string, chain ...domain.State) storage.Payment {
 	t.Helper()
 	payment := newPayment(t, key)
@@ -156,9 +156,9 @@ func TestIntegrationTransitionChain(t *testing.T) {
 
 	_, history, err := repo.Get(context.Background(), payment.ID)
 	require.NoError(t, err)
-	require.Len(t, history, 6, "создание плюс пять переходов")
+	require.Len(t, history, 6, "creation plus five transitions")
 	for i, item := range history {
-		assert.Equalf(t, int64(i+1), item.StateVersion, "версия записи %d", i)
+		assert.Equalf(t, int64(i+1), item.StateVersion, "entry version %d", i)
 	}
 }
 
@@ -191,15 +191,15 @@ func TestIntegrationConcurrentTransitionOnlyOneWins(t *testing.T) {
 		case errors.Is(err, domain.ErrStateConflict):
 			conflicts++
 		default:
-			t.Fatalf("неожиданная ошибка: %v", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
 	}
-	assert.Equal(t, 1, successes, "ровно один переход выигрывает гонку")
+	assert.Equal(t, 1, successes, "exactly one transition wins the race")
 	assert.Equal(t, 1, conflicts)
 
 	loaded, history, err := repo.Get(context.Background(), payment.ID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), loaded.StateVersion, "версия выросла один раз")
+	assert.Equal(t, int64(3), loaded.StateVersion, "the version increased once")
 	assert.Len(t, history, 3)
 }
 
@@ -210,12 +210,12 @@ func TestIntegrationStaleVersionRejected(t *testing.T) {
 	payment := paymentAtState(t, repo, "stale-1", domain.StateCreated, domain.StatePending)
 
 	_, err := repo.Transition(context.Background(), payment.ID, 1, domain.StateDetected, storage.TransitionPatch{})
-	require.ErrorIs(t, err, domain.ErrStateConflict, "устаревшая версия отклонена")
+	require.ErrorIs(t, err, domain.ErrStateConflict, "a stale version is rejected")
 
 	loaded, history, err := repo.Get(context.Background(), payment.ID)
 	require.NoError(t, err)
-	assert.Equal(t, payment.StateVersion, loaded.StateVersion, "версия после отказа не выросла")
-	assert.Len(t, history, int(payment.StateVersion), "журнал не получил лишних записей")
+	assert.Equal(t, payment.StateVersion, loaded.StateVersion, "the version did not increase after the rejection")
+	assert.Len(t, history, int(payment.StateVersion), "the journal received no extra entries")
 }
 
 func TestIntegrationForbiddenAndTerminalTransitions(t *testing.T) {
@@ -226,12 +226,12 @@ func TestIntegrationForbiddenAndTerminalTransitions(t *testing.T) {
 		domain.StateCreated, domain.StatePending, domain.StateDetected, domain.StateConfirming)
 
 	_, err := repo.Transition(context.Background(), payment.ID, uint64(payment.StateVersion), domain.StateDetected, storage.TransitionPatch{})
-	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "переход назад запрещен")
+	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "a backward transition is forbidden")
 
 	completed := paymentAtState(t, repo, "terminal-1",
 		domain.StateCreated, domain.StatePending, domain.StateDetected, domain.StateConfirming, domain.StateCompleted)
 	_, err = repo.Transition(context.Background(), completed.ID, uint64(completed.StateVersion), domain.StateFailed, storage.TransitionPatch{})
-	require.ErrorIs(t, err, domain.ErrTerminalState, "из терминального перехода нет")
+	require.ErrorIs(t, err, domain.ErrTerminalState, "there is no transition out of a terminal state")
 }
 
 func TestIntegrationSelfTransitionUpdatable(t *testing.T) {
@@ -246,7 +246,7 @@ func TestIntegrationSelfTransitionUpdatable(t *testing.T) {
 		Confirmations: &confirmations,
 	})
 	assert.Equal(t, string(domain.StateConfirming), updated.State)
-	assert.Equal(t, int64(6), updated.StateVersion, "самопереход увеличивает версию")
+	assert.Equal(t, int64(6), updated.StateVersion, "a self-transition increases the version")
 	assert.Equal(t, 2, updated.Confirmations)
 
 	_, history, err := repo.Get(context.Background(), payment.ID)
@@ -263,17 +263,18 @@ func TestIntegrationDatabaseTriggerSecondBarrier(t *testing.T) {
 	payment := paymentAtState(t, repo, "barrier-1",
 		domain.StateCreated, domain.StatePending, domain.StateDetected)
 
-	// Прямой SQL в обход CAS и домена: переход назад обязан отклонить триггер.
+	// Direct SQL bypassing CAS and the domain: the trigger must reject a
+	// backward transition.
 	backward := db.Exec("UPDATE payments SET state = 'pending', state_version = state_version + 1 WHERE id = ?", payment.ID)
 	require.Error(t, backward.Error)
 	assert.Contains(t, backward.Error.Error(), "forbidden")
 
-	// Перескок версии через прямой SQL отклоняется.
+	// A version jump via direct SQL is rejected.
 	skipped := db.Exec("UPDATE payments SET state = 'confirming', state_version = state_version + 5 WHERE id = ?", payment.ID)
 	require.Error(t, skipped.Error)
 	assert.Contains(t, skipped.Error.Error(), "state_version")
 
-	// Неизменяемые поля защищены.
+	// Immutable fields are protected.
 	immutable := db.Exec("UPDATE payments SET merchant_id = 'm-2', state = 'confirming', state_version = state_version + 1 WHERE id = ?", payment.ID)
 	require.Error(t, immutable.Error)
 	assert.Contains(t, immutable.Error.Error(), "immutable")
@@ -286,7 +287,7 @@ func TestIntegrationTerminalStateImmutableInDatabase(t *testing.T) {
 	completed := paymentAtState(t, repo, "frozen-1",
 		domain.StateCreated, domain.StatePending, domain.StateDetected, domain.StateConfirming, domain.StateCompleted)
 
-	// Самопереход в терминальном состоянии запрещен даже через прямой SQL.
+	// A self-transition in a terminal state is forbidden even via direct SQL.
 	frozen := db.Exec("UPDATE payments SET confirmations = confirmations + 1, state_version = state_version + 1 WHERE id = ?", completed.ID)
 	require.Error(t, frozen.Error)
 	assert.Contains(t, frozen.Error.Error(), "is immutable")
@@ -340,7 +341,7 @@ func TestIntegrationListWithCursorAndFilter(t *testing.T) {
 		ids[payment.ID] = struct{}{}
 		assert.Equal(t, "m-1", payment.MerchantID)
 	}
-	assert.Len(t, ids, 3, "страницы не пересекаются")
+	assert.Len(t, ids, 3, "the pages do not overlap")
 
 	state := domain.StateCreating
 	filtered, _, err := repo.List(ctx, storage.ListFilter{MerchantID: "m-1", State: &state})
@@ -375,8 +376,9 @@ func TestIntegrationFindExpiredAndStuck(t *testing.T) {
 
 	stuck := paymentAtState(t, repo, "stuck-1", domain.StateCreated, domain.StatePending, domain.StateDetected)
 
-	// updated_at ведет триггер переходов, поэтому «зависшесть» проверяется
-	// порогом в будущем: платеж в detected старше любого прошлого порога.
+	// The transition trigger maintains updated_at, so "stuckness" is checked
+	// with a future threshold: a payment in detected is older than any past
+	// threshold.
 	hung, err := repo.FindStuck(ctx, time.Now().UTC().Add(time.Hour), 10)
 	require.NoError(t, err)
 	require.Len(t, hung, 1)
@@ -384,7 +386,7 @@ func TestIntegrationFindExpiredAndStuck(t *testing.T) {
 
 	fresh, err := repo.FindStuck(ctx, time.Now().UTC().Add(-time.Hour), 10)
 	require.NoError(t, err)
-	assert.Empty(t, fresh, "свежий платеж не считается зависшим")
+	assert.Empty(t, fresh, "a fresh payment is not considered stuck")
 }
 
 func TestIntegrationFindCreating(t *testing.T) {
@@ -415,14 +417,14 @@ func TestIntegrationFindCreating(t *testing.T) {
 
 	found, err = repo.FindCreating(ctx, time.Now().UTC().Add(time.Minute), 10)
 	require.NoError(t, err)
-	require.Len(t, found, 2, "свежее и зависшее создания")
+	require.Len(t, found, 2, "a fresh and a stuck creation")
 	for _, row := range found {
-		assert.NotEqual(t, advanced.ID, row.ID, "нетерминальное создание вне creating не попадает в выборку")
+		assert.NotEqual(t, advanced.ID, row.ID, "a non-terminal creation outside creating is not selected")
 	}
 }
 
-// TestIntegrationFindCreatingBatchBeyondListLimit проверяет, что пакет фоновых
-// выборок не урезается потолком пользовательского списка (200).
+// TestIntegrationFindCreatingBatchBeyondListLimit checks that the background
+// batch is not cut by the user-facing list ceiling (200).
 func TestIntegrationFindCreatingBatchBeyondListLimit(t *testing.T) {
 	db := setupPaymentDB(t)
 	repo := storage.NewRepository(db)
@@ -437,7 +439,7 @@ func TestIntegrationFindCreatingBatchBeyondListLimit(t *testing.T) {
 
 	found, err := repo.FindCreating(ctx, time.Now().UTC(), 250)
 	require.NoError(t, err)
-	assert.Len(t, found, 205, "пакет фоновых выборок не режется лимитом списка")
+	assert.Len(t, found, 205, "the background batch is not cut by the list limit")
 
 	page, err := repo.FindCreating(ctx, time.Now().UTC(), 50)
 	require.NoError(t, err)
@@ -450,13 +452,13 @@ func TestIntegrationConstraints(t *testing.T) {
 
 	zero := newPayment(t, "zero-1")
 	zero.ExpectedAmount = 0
-	require.Error(t, repo.Create(context.Background(), zero), "нулевая сумма отклоняется CHECK-ом")
+	require.Error(t, repo.Create(context.Background(), zero), "a zero amount is rejected by the CHECK")
 
 	badAsset := newPayment(t, "asset-1")
 	badAsset.ExpectedAsset = "usdt"
-	require.Error(t, repo.Create(context.Background(), badAsset), "актив в нижнем регистре отклоняется")
+	require.Error(t, repo.Create(context.Background(), badAsset), "a lowercase asset is rejected")
 
-	// Create принудительно возвращает платеж в creating/версию 1.
+	// Create forcibly returns the payment to creating/version 1.
 	forced := newPayment(t, "forced-1")
 	forced.State = string(domain.StateCompleted)
 	forced.StateVersion = 7
@@ -467,7 +469,8 @@ func TestIntegrationConstraints(t *testing.T) {
 	assert.Equal(t, int64(1), loaded.StateVersion)
 	require.Len(t, history, 1)
 
-	// Прямой INSERT в обход автомата отклоняет BEFORE INSERT триггер.
+	// A direct INSERT bypassing the state machine is rejected by the BEFORE
+	// INSERT trigger.
 	rawID, err := uuid.NewV7()
 	require.NoError(t, err)
 	raw := db.Exec(`INSERT INTO payments (id, merchant_id, idempotency_key, request_hash, state, state_version,
@@ -476,17 +479,17 @@ func TestIntegrationConstraints(t *testing.T) {
 	require.Error(t, raw.Error)
 	assert.Contains(t, raw.Error.Error(), "creating")
 
-	// Границы CHECK: шкала вне диапазона и отрицательная полученная сумма.
+	// CHECK bounds: the scale out of range and a negative received amount.
 	badDecimals := newPayment(t, "decimals-1")
 	badDecimals.ExpectedDecimals = 19
-	require.Error(t, repo.Create(context.Background(), badDecimals), "decimals вне 0 - 18 отклоняются")
+	require.Error(t, repo.Create(context.Background(), badDecimals), "decimals outside 0 - 18 are rejected")
 
 	negative := paymentAtState(t, repo, "negative-1", domain.StateCreated)
 	negativeAmount := int64(-1)
 	_, err = repo.Transition(context.Background(), negative.ID, uint64(negative.StateVersion), domain.StatePending, storage.TransitionPatch{
 		ReceivedAmount: &negativeAmount,
 	})
-	require.Error(t, err, "отрицательная полученная сумма отклоняется CHECK-ом")
+	require.Error(t, err, "a negative received amount is rejected by the CHECK")
 }
 
 func TestIntegrationCompletedAtOnlyTerminalSuccess(t *testing.T) {
@@ -498,7 +501,7 @@ func TestIntegrationCompletedAtOnlyTerminalSuccess(t *testing.T) {
 	_, err := repo.Transition(context.Background(), payment.ID, uint64(payment.StateVersion), domain.StateFailed, storage.TransitionPatch{
 		CompletedAt: &completedAt,
 	})
-	require.Error(t, err, "completed_at допустим только в completed/underpaid/overpaid")
+	require.Error(t, err, "completed_at is allowed only in completed/underpaid/overpaid")
 
 	ok := paymentAtState(t, repo, "done-2", domain.StateCreated, domain.StatePending, domain.StateDetected, domain.StateConfirming)
 	updated := transition(t, repo, ok.ID, uint64(ok.StateVersion), domain.StateCompleted, storage.TransitionPatch{CompletedAt: &completedAt})
@@ -514,12 +517,13 @@ func TestIntegrationTransitionsDictionary(t *testing.T) {
 
 	fake := db.Exec(`INSERT INTO payment_transitions (payment_id, from_state, to_state, state_version)
 		VALUES (?, '', 'nonsense', 2)`, payment.ID)
-	require.Error(t, fake.Error, "неизвестное состояние не проходит словарь журнала")
+	require.Error(t, fake.Error, "an unknown state does not pass the journal dictionary")
 }
 
-// TestIntegrationTriggerMirrorsMatrix перебирает все пары состояний против
-// триггера БД: разрешенные парой матрицы (и самопереходы в нетерминальных)
-// должны проходить, остальные - отклоняться. Ловит дрейф Go-матрицы и SQL.
+// TestIntegrationTriggerMirrorsMatrix enumerates all state pairs against the
+// database trigger: pairs allowed by the matrix (and self-transitions in
+// non-terminal states) must pass, the rest must be rejected. It catches drift
+// between the Go matrix and SQL.
 func TestIntegrationTriggerMirrorsMatrix(t *testing.T) {
 	db := setupPaymentDB(t)
 	repo := storage.NewRepository(db)
@@ -542,13 +546,13 @@ func TestIntegrationTriggerMirrorsMatrix(t *testing.T) {
 		for _, to := range allStates {
 			index++
 			payment := paymentAtState(t, repo, fmt.Sprintf("mx-%d", index), chains[from]...)
-			require.Equalf(t, string(from), payment.State, "цепочка доводит до %s", from)
+			require.Equalf(t, string(from), payment.State, "the chain brings the payment to %s", from)
 			res := db.Exec("UPDATE payments SET state = ?, state_version = state_version + 1 WHERE id = ?", string(to), payment.ID)
 			want := domain.AllowedTransition(from, to) || (from == to && !domain.Terminal(from))
 			if want {
-				require.NoErrorf(t, res.Error, "SQL-матрица должна разрешать %s -> %s", from, to)
+				require.NoErrorf(t, res.Error, "the SQL matrix must allow %s -> %s", from, to)
 			} else {
-				require.Errorf(t, res.Error, "SQL-матрица должна запрещать %s -> %s", from, to)
+				require.Errorf(t, res.Error, "the SQL matrix must forbid %s -> %s", from, to)
 			}
 		}
 	}

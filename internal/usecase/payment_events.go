@@ -19,24 +19,24 @@ import (
 	"github.com/cbl/cbl-payment/internal/storage"
 )
 
-// Константы событий payment.events (CBL-003, раздел 6).
+// Constants of payment.events events (CBL-003, section 6).
 const (
-	// ProducerPayment задает имя сервиса-продюсера событий платежа.
+	// ProducerPayment defines the name of the payment event producer service.
 	ProducerPayment = "cbl-payment"
-	// TopicPaymentEvents задает топик событий жизненного цикла платежа.
+	// TopicPaymentEvents defines the payment lifecycle events topic.
 	TopicPaymentEvents = "payment.events"
-	// SchemaVersion задает версию схемы событий платежа.
+	// SchemaVersion defines the payment event schema version.
 	SchemaVersion = "v1"
 )
 
-// PaymentEventSink собирает protobuf-конверты payment.events и пишет их в outbox
-// в транзакции перехода (storage.TransitionEventSink).
+// PaymentEventSink assembles payment.events protobuf envelopes and writes them
+// to the outbox in the transition transaction (storage.TransitionEventSink).
 type PaymentEventSink struct {
 	store *outbox.Store
 	log   *zap.Logger
 }
 
-// NewPaymentEventSink создает PaymentEventSink.
+// NewPaymentEventSink creates a PaymentEventSink.
 func NewPaymentEventSink(log *zap.Logger) *PaymentEventSink {
 	if log == nil {
 		log = zap.NewNop()
@@ -44,9 +44,9 @@ func NewPaymentEventSink(log *zap.Logger) *PaymentEventSink {
 	return &PaymentEventSink{store: outbox.NewStore(), log: log}
 }
 
-// AppendTransitionEvent собирает конверт события и записывает его в outbox.
-// Переходы в состояния без типа в CF-2 (pending, cancelled, creating)
-// пропускаются: контракт не имеет для них события.
+// AppendTransitionEvent assembles the event envelope and writes it to the outbox.
+// Transitions to states without a type in CF-2 (pending, cancelled, creating)
+// are skipped: the contract has no event for them.
 func (s *PaymentEventSink) AppendTransitionEvent(ctx context.Context, tx *gorm.DB, event storage.TransitionEvent) error {
 	envelope, emit, err := BuildPaymentEventEnvelope(event)
 	if err != nil {
@@ -66,9 +66,9 @@ func (s *PaymentEventSink) AppendTransitionEvent(ctx context.Context, tx *gorm.D
 	return nil
 }
 
-// BuildPaymentEventEnvelope собирает конверт payment.events для перехода:
-// protobuf-тело billing.events.v1.PaymentEvent и заголовки конверта CBL.
-// Второе значение false означает, что состояние не имеет типа события в CF-2.
+// BuildPaymentEventEnvelope assembles the payment.events envelope for a
+// transition: the billing.events.v1.PaymentEvent protobuf body and the CBL
+// envelope headers. The second value false means the state has no event type in CF-2.
 func BuildPaymentEventEnvelope(event storage.TransitionEvent) (outbox.Envelope, bool, error) {
 	eventType, emit := paymentEventType(event.To)
 	if !emit {
@@ -89,7 +89,7 @@ func BuildPaymentEventEnvelope(event storage.TransitionEvent) (outbox.Envelope, 
 		QuoteId: derefString(event.Payment.QuoteID),
 		Rate:    derefString(event.Payment.Rate),
 		Txid:    derefString(event.Payment.TxID),
-		// Версия гарантированно положительна (CHECK >= 1).
+		// The version is guaranteed positive (CHECK >= 1).
 		StateVersion: uint64(event.Payment.StateVersion), //nolint:gosec
 		OccurredAt:   timestamppb.New(event.OccurredAt.UTC()),
 	}
@@ -119,8 +119,8 @@ func BuildPaymentEventEnvelope(event storage.TransitionEvent) (outbox.Envelope, 
 	return envelope, true, nil
 }
 
-// paymentEventType переводит целевое состояние перехода в контрактный тип;
-// состояния pending, cancelled и creating типа не имеют (CF-2).
+// paymentEventType translates the transition target state into the contract type;
+// the pending, cancelled and creating states have no type (CF-2).
 func paymentEventType(state domain.State) (eventsv1.PaymentEventType, bool) {
 	switch state {
 	case domain.StateCreated:
@@ -144,8 +144,8 @@ func paymentEventType(state domain.State) (eventsv1.PaymentEventType, bool) {
 	}
 }
 
-// moneyFrom собирает Money из необязательной тройки полей; неполная тройка
-// (сумма без актива или шкалы) денег не образует и опускается.
+// moneyFrom assembles Money from an optional triple of fields; an incomplete
+// triple (amount without asset or scale) does not form money and is omitted.
 func moneyFrom(amount *int64, asset *string, decimals *int) *commonv1.Money {
 	if amount == nil || asset == nil || decimals == nil {
 		return nil
@@ -157,7 +157,7 @@ func moneyFrom(amount *int64, asset *string, decimals *int) *commonv1.Money {
 	}
 }
 
-// derefString разыменовывает необязательную строку (nil - пустая).
+// derefString dereferences an optional string (nil means empty).
 func derefString(value *string) string {
 	if value == nil {
 		return ""
@@ -165,7 +165,7 @@ func derefString(value *string) string {
 	return *value
 }
 
-// decimalsToUint32 безопасно переводит шкалу в uint32 контракта.
+// decimalsToUint32 safely converts the scale into the contract uint32.
 func decimalsToUint32(decimals int) uint32 {
 	if decimals < 0 {
 		return 0

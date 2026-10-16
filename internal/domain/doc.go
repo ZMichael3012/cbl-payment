@@ -1,3 +1,3 @@
-// Пакет domain содержит доменные модели, инварианты и правила сервиса payment,
-// не зависящие от транспорта и хранилищ.
+// Package domain contains the domain models, invariants and rules of the payment
+// service that do not depend on transport or storage.
 package domain

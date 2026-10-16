@@ -10,35 +10,35 @@ import (
 	"github.com/cbl/cbl-payment/internal/domain"
 )
 
-// TransitionEvent описывает примененный переход состояния для публикации в
-// payment.events (4.7): снимок платежа после перехода и служебные поля журнала.
+// TransitionEvent describes an applied state transition for publication to
+// payment.events (4.7): a payment snapshot after the transition and journal service fields.
 type TransitionEvent struct {
-	// Payment задает снимок платежа после перехода (включая новую версию).
+	// Payment holds the payment snapshot after the transition (including the new version).
 	Payment Payment
-	// From задает состояние до перехода.
+	// From holds the state before the transition.
 	From domain.State
-	// To задает состояние после перехода.
+	// To holds the state after the transition.
 	To domain.State
-	// OccurredAt задает время перехода (строка журнала).
+	// OccurredAt holds the transition time (the journal row).
 	OccurredAt time.Time
-	// Traceparent задает W3C trace context для конверта (если известен).
+	// Traceparent holds the W3C trace context for the envelope (if known).
 	Traceparent string
 }
 
-// TransitionEventSink записывает событие payment.events в outbox в транзакции
-// перехода: событие и бизнес-изменение коммитятся или откатываются вместе.
+// TransitionEventSink writes a payment.events event to the outbox within the
+// transition transaction: the event and the business change commit or roll back together.
 type TransitionEventSink interface {
-	// AppendTransitionEvent добавляет конверт события в переданной транзакции.
+	// AppendTransitionEvent appends the event envelope within the given transaction.
 	AppendTransitionEvent(ctx context.Context, tx *gorm.DB, event TransitionEvent) error
 }
 
-// WithEventSink подключает запись payment.events; без sink события не пишутся.
+// WithEventSink enables payment.events writing; without a sink no events are written.
 func WithEventSink(sink TransitionEventSink) Option {
 	return func(r *Repository) { r.eventSink = sink }
 }
 
-// emitTransitionEvent передает событие sink-у, если он настроен; явно заданный
-// traceparent не затирается значением из контекста.
+// emitTransitionEvent passes the event to the sink when it is configured; an
+// explicitly set traceparent is not overwritten by the value from the context.
 func (r *Repository) emitTransitionEvent(ctx context.Context, tx *gorm.DB, event TransitionEvent) error {
 	if r.eventSink == nil {
 		return nil
@@ -49,16 +49,16 @@ func (r *Repository) emitTransitionEvent(ctx context.Context, tx *gorm.DB, event
 	return r.eventSink.AppendTransitionEvent(ctx, tx, event)
 }
 
-// traceparentKey задает ключ контекста для W3C traceparent.
+// traceparentKey holds the context key for the W3C traceparent.
 type traceparentKey struct{}
 
-// traceparentPattern задает формат W3C trace context; произвольная строка из
-// заголовка Kafka не должна попадать в конверты и логи downstream.
+// traceparentPattern holds the W3C trace context format; an arbitrary string
+// from a Kafka header must not reach envelopes and downstream logs.
 var traceparentPattern = regexp.MustCompile(`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`)
 
-// WithTraceparent сохраняет traceparent в контексте: consumer кладет заголовок
-// канонического события, и событие платежа наследует трассировку источника.
-// Невалидный по формату W3C заголовок игнорируется.
+// WithTraceparent stores the traceparent in the context: the consumer passes the
+// canonical event header, and the payment event inherits the source tracing.
+// A header with an invalid W3C format is ignored.
 func WithTraceparent(ctx context.Context, traceparent string) context.Context {
 	if !traceparentPattern.MatchString(traceparent) {
 		return ctx
@@ -66,7 +66,7 @@ func WithTraceparent(ctx context.Context, traceparent string) context.Context {
 	return context.WithValue(ctx, traceparentKey{}, traceparent)
 }
 
-// traceparentFromContext извлекает traceparent из контекста.
+// traceparentFromContext extracts the traceparent from the context.
 func traceparentFromContext(ctx context.Context) string {
 	value, _ := ctx.Value(traceparentKey{}).(string)
 	return value

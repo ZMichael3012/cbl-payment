@@ -24,20 +24,20 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// failingSink отказывает в записи события: проверка атомарности перехода.
+// failingSink refuses to write the event: transition atomicity check.
 type failingSink struct{ err error }
 
-// AppendTransitionEvent всегда возвращает ошибку.
+// AppendTransitionEvent always returns an error.
 func (f failingSink) AppendTransitionEvent(context.Context, *gorm.DB, storage.TransitionEvent) error {
 	return f.err
 }
 
-// sinkRepository собирает репозиторий с реальным sink-ом payment.events.
+// sinkRepository assembles a repository with the real payment.events sink.
 func sinkRepository(db *gorm.DB) *storage.Repository {
 	return storage.NewRepository(db, storage.WithEventSink(usecase.NewPaymentEventSink(zap.NewNop())))
 }
 
-// readOutbox возвращает строки outbox в порядке вставки.
+// readOutbox returns the outbox rows in insertion order.
 func readOutbox(t *testing.T, db *gorm.DB) []outbox.Record {
 	t.Helper()
 	var records []outbox.Record
@@ -45,7 +45,7 @@ func readOutbox(t *testing.T, db *gorm.DB) []outbox.Record {
 	return records
 }
 
-// decodeEvent разбирает строку outbox в PaymentEvent.
+// decodeEvent decodes an outbox row into a PaymentEvent.
 func decodeEvent(t *testing.T, record outbox.Record) *eventsv1.PaymentEvent {
 	t.Helper()
 	payload := &eventsv1.PaymentEvent{}
@@ -59,7 +59,7 @@ func TestIntegrationTransitionEmitsPaymentEvent(t *testing.T) {
 	ctx := context.Background()
 
 	payment := newJanitorIntegrationPayment(t, repo, "events-1")
-	assert.Empty(t, readOutbox(t, db), "создание события не пишет: creating вне контракта CF-2")
+	assert.Empty(t, readOutbox(t, db), "creation does not emit an event: creating is outside the CF-2 contract")
 
 	traceparent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	traced := storage.WithTraceparent(ctx, traceparent)
@@ -82,15 +82,15 @@ func TestIntegrationTransitionEmitsPaymentEvent(t *testing.T) {
 	assert.Equal(t, uint64(payment.StateVersion), payload.GetStateVersion())
 	assert.Equal(t, record.Headers[outbox.HeaderOccurredAt],
 		payload.GetOccurredAt().AsTime().UTC().Format(time.RFC3339Nano),
-		"заголовок occurred_at зеркалит тело")
+		"the occurred_at header mirrors the body")
 
-	// Переход в pending типа события не имеет: строк не добавляется.
+	// The transition to pending has no event type: no rows are added.
 	payment, err = repo.Transition(ctx, payment.ID, uint64(payment.StateVersion), domain.StatePending, storage.TransitionPatch{})
 	require.NoError(t, err)
 	records = readOutbox(t, db)
-	require.Len(t, records, 1, "переход в pending события не имеет")
+	require.Len(t, records, 1, "the transition to pending has no event")
 
-	// Невалидный traceparent не попадает в конверт.
+	// An invalid traceparent does not go into the envelope.
 	badCtx := storage.WithTraceparent(ctx, "not-a-traceparent")
 	payment, err = repo.Transition(badCtx, payment.ID, uint64(payment.StateVersion), domain.StateDetected, storage.TransitionPatch{})
 	require.NoError(t, err)
@@ -112,7 +112,7 @@ func TestIntegrationTransitionConflictEmitsNothing(t *testing.T) {
 
 	_, err = repo.Transition(ctx, payment.ID, 1, domain.StatePending, storage.TransitionPatch{})
 	require.ErrorIs(t, err, domain.ErrStateConflict)
-	assert.Len(t, readOutbox(t, db), 1, "конфликт версии не оставляет события")
+	assert.Len(t, readOutbox(t, db), 1, "a version conflict leaves no event")
 
 	_, history, err := repo.Get(ctx, payment.ID)
 	require.NoError(t, err)
@@ -135,9 +135,9 @@ func TestIntegrationSinkFailureRollsBackTransition(t *testing.T) {
 
 	unchanged, history, err := repo.Get(ctx, payment.ID)
 	require.NoError(t, err)
-	assert.Equal(t, string(domain.StateCreated), unchanged.State, "сбой sink откатывает переход")
+	assert.Equal(t, string(domain.StateCreated), unchanged.State, "a sink failure rolls back the transition")
 	assert.Equal(t, payment.StateVersion, unchanged.StateVersion)
-	assert.Len(t, history, 2, "журнал перехода тоже откачен")
+	assert.Len(t, history, 2, "the transition journal is rolled back as well")
 	assert.Len(t, readOutbox(t, db), 1)
 }
 
@@ -158,7 +158,7 @@ func TestIntegrationConsumerChainEmitsOrderedEvents(t *testing.T) {
 	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, confirmed)))
 
 	records := readOutbox(t, db)
-	require.Len(t, records, 4, "created, detected, confirming и self-переход confirming")
+	require.Len(t, records, 4, "created, detected, confirming and the confirming self-transition")
 	wantTypes := []string{"payment.created", "payment.detected", "payment.confirming", "payment.confirming"}
 	wantVersions := []uint64{2, 4, 5, 6}
 	for i, record := range records {
@@ -166,7 +166,7 @@ func TestIntegrationConsumerChainEmitsOrderedEvents(t *testing.T) {
 		payload := decodeEvent(t, record)
 		assert.Equal(t, wantVersions[i], payload.GetStateVersion())
 		if i > 0 {
-			assert.Less(t, records[i-1].ID, record.ID, "порядок публикации по id outbox")
+			assert.Less(t, records[i-1].ID, record.ID, "publication order by outbox id")
 		}
 	}
 }

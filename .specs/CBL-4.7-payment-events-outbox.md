@@ -1,52 +1,57 @@
-# CBL-4.7. Публикация payment.events через outbox
+# CBL-4.7. Publishing payment.events via outbox
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E4, Payment Service |
-| Репозиторий | `cbl-payment` |
-| Размер | S |
-| Волна и параллельная группа | W2-PAYMENT |
-| Зависит от | 4.1, 4.3, 4.5, 4.6 (все источники переходов) |
-| Версия контрактов | `cbl-protos@cf-2` (`billing/events/v1/PaymentEvent`, topic `payment.events`) |
-| Статус | done, ревью закрыто |
+| Epic | E4, Payment Service |
+| Repository | `cbl-payment` |
+| Size | S |
+| Wave and parallel group | W2-PAYMENT |
+| Depends on | 4.1, 4.3, 4.5, 4.6 (all transition sources) |
+| Contract version | `cbl-protos@cf-2` (`billing/events/v1/PaymentEvent`, topic `payment.events`) |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-`payment.events` - контракт жизненного цикла платежа для Ledger (2.7), Notification
-(8.x) и ClickHouse (11.x): `CBL-003` раздел 6 фиксирует топик, ключ `payment_id`,
-типы `payment.<state>`, поля `merchant_id`, `expected_amount`, `received_amount`,
-`fee`, `quote_id`, `rate`, `txid`, `state_version`. Схема `PaymentEvent` заморожена
-CF-2 (`proto/billing/events/v1/payment_events.proto`).
+`payment.events` is the payment lifecycle contract for Ledger (2.7), Notification
+(8.x) and ClickHouse (11.x): `CBL-003` section 6 fixes the topic, the key `payment_id`,
+the types `payment.<state>`, the fields `merchant_id`, `expected_amount`,
+`received_amount`, `fee`, `quote_id`, `rate`, `txid`, `state_version`. The
+`PaymentEvent` schema is frozen by CF-2
+(`proto/billing/events/v1/payment_events.proto`).
 
-До 4.7 payment не публикует ничего: переходы автомата (consumer 4.3, политика 4.5,
-janitor 4.6) существуют только в `payments`/`payment_transitions`, а Money-контур
-Ledger ждет `payment.completed` (KI-ledger-02: путь записи уже открыт через Kafka).
-Задача реализует продюсер по модели transactional outbox (`CBL-000` раздел 4):
-событие пишется в таблицу `outbox` (00002) в одной транзакции с переходом, relay
-kit публикует его в Kafka at-least-once через `FOR UPDATE SKIP LOCKED`.
+Before 4.7, payment publishes nothing: state machine transitions (consumer 4.3,
+policy 4.5, janitor 4.6) exist only in `payments`/`payment_transitions`, while the
+Ledger money loop waits for `payment.completed` (KI-ledger-02: the posting path is
+already open through Kafka). The task implements a producer following the
+transactional outbox model (`CBL-000` section 4): the event is written to the
+`outbox` table (00002) in the same transaction as the transition, and the relay
+kit publishes it to Kafka at-least-once via `FOR UPDATE SKIP LOCKED`.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: событийный sink на единой точке переходов `Repository.TransitionTx`,
-сборка `PaymentEvent`/конверта, relay в `main`, traceparent-контекст consumer-а,
-тесты unit/integration/e2e (Kafka), проверка outbox в compose-сценарии.
+In scope: the event sink at the single transition point `Repository.TransitionTx`,
+`PaymentEvent`/envelope construction, the relay in `main`, the traceparent context
+of the consumer, unit/integration/e2e tests (Kafka), outbox checks in the compose
+scenario.
 
-Out of scope: потребление `payment.events` (Ledger 2.7 уже реализован, Notification
-8.x, ClickHouse 11.x); topics-init глобального стенда (0.5); метрики relay (0.7);
-изменение схем CF-2 (заморожена; недостающие типы - вопрос CF-3).
+Out of scope: consuming `payment.events` (Ledger 2.7 is already implemented,
+Notification 8.x, ClickHouse 11.x); topics-init of the global stand (0.5); relay
+metrics (0.7); changing the CF-2 schemas (frozen; missing types are a CF-3
+question).
 
-## 3. Функциональные требования
+## 3. Functional requirements
 
-FR-1. Единая точка публикации: `Repository.TransitionTx` после успешного UPDATE
-платежа и вставки строки `payment_transitions` вызывает настроенный sink в той же
-транзакции. Outbox-строка и переход коммитятся или откатываются вместе: сбой
-sink откатывает переход, конфликт версии (`ErrStateConflict`) и пропущенные
-(stale/too-early) события не оставляют outbox-строк. `Create` (состояние
-`creating`) событий не порождает: `creating` не входит в контракт CF-2.
+FR-1. Single publication point: `Repository.TransitionTx`, after a successful
+payment UPDATE and insertion of the `payment_transitions` row, calls the configured
+sink in the same transaction. The outbox row and the transition are committed or
+rolled back together: a sink failure rolls back the transition, a version conflict
+(`ErrStateConflict`) and skipped (stale/too-early) events leave no outbox row.
+`Create` (the `creating` state) does not produce events: `creating` is not part of
+the CF-2 contract.
 
-FR-2. Тип события по целевому состоянию перехода:
+FR-2. Event type by the target state of the transition:
 
-| Целевое состояние | event_type | PaymentEventType |
+| Target state | event_type | PaymentEventType |
 | :-- | :-- | :-- |
 | created | payment.created | CREATED |
 | detected | payment.detected | DETECTED |
@@ -56,159 +61,166 @@ FR-2. Тип события по целевому состоянию перех�
 | underpaid | payment.underpaid | UNDERPAID |
 | overpaid | payment.overpaid | OVERPAID |
 | failed | payment.failed | FAILED |
-| pending, cancelled, creating | - (нет типа в CF-2) | - |
+| pending, cancelled, creating | - (no type in CF-2) | - |
 
-Самопереходы (`from == to`: повторное `detected`, набор подтверждений в
-`confirming`) событие пишут: state_version растет, событие фиксирует новое
-состояние/данные (решение и альтернатива - раздел 11).
+Self-transitions (`from == to`: repeated `detected`, confirmation collection in
+`confirming`) do write an event: state_version grows, the event fixes the new
+state/data (decision and alternative - section 11).
 
-FR-3. Тело `billing.events.v1.PaymentEvent` (CF-2): `payment_id`,
+FR-3. Body of `billing.events.v1.PaymentEvent` (CF-2): `payment_id`,
 `merchant_id`, `type`, `expected_amount` (Money: `minor_units`/`asset`/`decimals`
-из `expected_*`), `received_amount` (при заданной полученной сумме), `fee`
-(только при полной тройке `fee_amount`/`fee_asset`/`fee_decimals`; частичная
-тройка опускается, так как не образует Money), `quote_id`, `rate`, `txid`
-(пустые значения - пустые строки), `state_version` (версия после перехода),
-`occurred_at` (время строки журнала, авторитетно в теле).
+from `expected_*`), `received_amount` (when the received amount is set), `fee`
+(only with the complete triple `fee_amount`/`fee_asset`/`fee_decimals`; a partial
+triple is omitted since it does not form Money), `quote_id`, `rate`, `txid`
+(empty values - empty strings), `state_version` (the version after the transition),
+`occurred_at` (the journal row timestamp, authoritative in the body).
 
-FR-4. Конверт: `topic = payment.events`, `key = payment_id`, заголовки
-`event_id` (UUIDv7, генерирует kit), `event_type = payment.<state>`,
-`occurred_at` (RFC 3339Nano UTC, зеркалит тело), `producer = cbl-payment`,
-`schema_version = v1`, `traceparent` - при наличии в контексте. Traceparent
-кладёт consumer 4.3 из заголовков канонического события; janitor и прочие
-фоновые переходы идут без него. Валидация W3C-формата - как в леджере
-(`storage.WithTraceparent`): невалидный заголовок не попадает в конверт.
+FR-4. Envelope: `topic = payment.events`, `key = payment_id`, headers
+`event_id` (UUIDv7, generated by the kit), `event_type = payment.<state>`,
+`occurred_at` (RFC 3339Nano UTC, mirrors the body), `producer = cbl-payment`,
+`schema_version = v1`, `traceparent` - when present in the context. Traceparent is
+put by consumer 4.3 from the headers of the canonical event; the janitor and other
+background transitions go without it. W3C format validation is the same as in the
+ledger (`storage.WithTraceparent`): an invalid header does not get into the
+envelope.
 
-FR-5. Relay: в `main` при заданных `KAFKA_BROKERS` рядом с consumer-ом
-запускается kit relay (`outbox.NewRelay`) на существующем publisher-е
-(at-least-once, батч 100, интервал 250 мс - значения kit); без Kafka переходы
-работают, события накапливаются в `outbox` с WARN-логом. Публикация - after-commit
-относительно перехода (relay читает только закоммиченные строки).
+FR-5. Relay: in `main`, with `KAFKA_BROKERS` set, the kit relay (`outbox.NewRelay`)
+starts next to the consumer on the existing publisher (at-least-once, batch 100,
+interval 250 ms - kit values); without Kafka, transitions work and events
+accumulate in `outbox` with a WARN log. Publication is after-commit relative to
+the transition (the relay reads only committed rows).
 
-FR-6. Наблюдаемость: Debug-лог постановки события (`payment event queued in
-outbox`, event_id/тип/payment_id/state_version, без сумм и реквизитов); relay
-пишет свои логи kit (`outbox published batch`, `outbox publish batch failed`);
-при пустом `KAFKA_BROKERS` старт пишет WARN о накоплении событий в outbox.
+FR-6. Observability: a Debug log of event enqueueing (`payment event queued in
+outbox`, event_id/type/payment_id/state_version, without amounts and payment
+details); the relay writes its own kit logs (`outbox published batch`, `outbox
+publish batch failed`); with an empty `KAFKA_BROKERS`, startup writes a WARN about
+events accumulating in the outbox.
 
-FR-7. Порядок и дубли: события одного платежа одного состояния несут монотонную
-`state_version`; at-least-once допускает дубли (потребители дедуплицируют по
-`event_id` inbox-ом и отбрасывают устаревшие версии - `CBL-003`); порядок
-публикации строк - по `id` outbox, порядок между транзакциями не гарантируется.
+FR-7. Order and duplicates: events of the same payment of the same state carry a
+monotonic `state_version`; at-least-once allows duplicates (consumers deduplicate
+by `event_id` with an inbox and discard stale versions - `CBL-003`); the
+publication order of rows is by outbox `id`, the order between transactions is not
+guaranteed.
 
-## 4. Контракты
+## 4. Contracts
 
-- Kafka: topic `payment.events` (продюсер), ключ `payment_id`; заголовки конверта
+- Kafka: topic `payment.events` (producer), key `payment_id`; envelope headers
   (`event_id`, `event_type`, `occurred_at`, `producer`, `schema_version`,
-  `traceparent`) - kit `outbox`; тело - `billing.events.v1.PaymentEvent`
-  (`cbl-protos@cf-2`). Retry/DLQ-топики продюсер не использует (они у
-  потребителей).
-- Хранилище: `outbox` (миграция 00002, DDL из kit), модель - `kit/outbox.Record`;
-  новых миграций нет.
+  `traceparent`) - kit `outbox`; body - `billing.events.v1.PaymentEvent`
+  (`cbl-protos@cf-2`). The producer does not use retry/DLQ topics (those belong to
+  consumers).
+- Storage: `outbox` (migration 00002, DDL from the kit), model - `kit/outbox.Record`;
+  there are no new migrations.
 
-## 5. Модель данных и миграций
+## 5. Data model and migrations
 
-Таблица `outbox` создана в 4.1 (00002). Изменения схемы не требуются.
-`payment_transitions` остается единственным журналом переходов; связь события и
-перехода - через `state_version`/`occurred_at` в теле.
+The `outbox` table was created in 4.1 (00002). Schema changes are not required.
+`payment_transitions` remains the only transition journal; the link between the
+event and the transition is via `state_version`/`occurred_at` in the body.
 
-## 6. Конечные автоматы и правила
+## 6. State machines and rules
 
-Публикация не меняет матрицу: событие - следствие уже разрешенного перехода.
-Событийные типы соответствуют целевым состояниям (FR-2); `cancelled` и `pending`
-контракт CF-2 не покрывает (замороженная схема; расширение - вопрос CF-3 и
-владельца контракта).
+Publication does not change the matrix: an event is a consequence of an already
+allowed transition. Event types correspond to target states (FR-2); `cancelled` and
+`pending` are not covered by the CF-2 contract (frozen schema; extension is a CF-3
+and contract owner question).
 
 ## 7. Edge cases
 
-Переход в `pending`/`cancelled` (события нет); самопереход (событие есть, версия
-выросла); чейн из нескольких переходов одной транзакцией (confirmed-first:
-`detected` + `confirming` + `completed` - столько же outbox-строк, публикуются по
-порядку id); конфликт версии после частичного применения цепочки (outbox-строки
-откаченных переходов исчезают вместе с ними); сбой sink (переход откатывается,
-ошибка возвращается вызывающему - для consumer это retry-контур, для janitor -
-`errors`); `received_amount` NULL (поле опущено); частичная тройка `fee`
-(опущена); `decimals` в пределах CHECK 0 - 18 (приведение к uint32 безопасно);
-`state_version` из CHECK >= 1 (приведение к uint64 безопасно); пустые
-`quote_id`/`rate`/`txid`; отсутствие Kafka (накопление, WARN при старте);
-отсутствие топика `payment.events` (relay повторяет публикацию, строки не
-теряются); очень длинные строки реквизитов (в лог не пишутся вовсе).
+A transition to `pending`/`cancelled` (no event); a self-transition (an event
+exists, the version grew); a chain of several transitions in one transaction
+(confirmed-first: `detected` + `confirming` + `completed` - the same number of
+outbox rows, published in id order); a version conflict after partial application
+of a chain (outbox rows of rolled back transitions disappear together with them);
+a sink failure (the transition is rolled back, the error is returned to the caller
+- for the consumer this is the retry loop, for the janitor - `errors`);
+`received_amount` NULL (the field is omitted); a partial `fee` triple (omitted);
+`decimals` within the CHECK 0 - 18 (conversion to uint32 is safe); `state_version`
+from the CHECK >= 1 (conversion to uint64 is safe); empty
+`quote_id`/`rate`/`txid`; no Kafka (accumulation, WARN at startup); no
+`payment.events` topic (the relay repeats publication, rows are not lost); very
+long payment detail strings (not written to the log at all).
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-Публикация не в горячем пути ответа: outbox-запись - INSERT в транзакцию
-перехода (T-PAY-07); relay - отдельная горутина; пакетность kit (100) и частичный
-индекс `outbox_pending_idx` (00002); задержка события от перехода до Kafka -
-единицы сотен миллисекунд при живом relay (интервал 250 мс); нагрузка relay
-учтена бенчмарком леджера (2.9); память события не зависит от тела платежа
-(все поля - скаляры).
+Publication is not on the response hot path: the outbox record is an INSERT into
+the transition transaction (T-PAY-07); the relay is a separate goroutine; kit
+batching (100) and the partial index `outbox_pending_idx` (00002); the delay of an
+event from the transition to Kafka is on the order of hundreds of milliseconds with
+a live relay (interval 250 ms); the relay load is accounted for by the ledger
+benchmark (2.9); the event memory does not depend on the payment body (all fields
+are scalars).
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Smoke | сборка, запуск main без Kafka (WARN, переходы работают) |
-| Unit (usecase) | сборка конверта для каждого типа FR-2; пропуск `pending`/`cancelled`/`creating`; самопереход пишет событие; частичная тройка fee опущена; received NULL опущен; traceparent в заголовках; occurred_at в теле и заголовке; producer/schema_version/ключ/топик; state_version |
-| Unit (storage) | валидация traceparent-контекста (формат W3C) |
-| Integration | реальный PostgreSQL: переход пишет outbox-строку (тело разбирается в PaymentEvent, заголовки); конфликт версии - без строки; цепочка consumer-а (detected, confirming) - две строки в порядке версий; janitor expired - строка `payment.expired`; сбой sink откатывает переход и журнал |
-| E2E | Kafka + PostgreSQL (testcontainers): канонические события проводят платеж до completed, relay публикует `payment.events`, внешний потребитель видит `payment.detected`/`payment.confirming`/`payment.completed` с совпадающими state_version и occurred_at; дубликат записи не порождает новых событий |
-| E2E локальный | compose (`test/e2e/schema.ps1`): после janitor-событий в `outbox` есть строки `payment.expired`/`payment.failed`, топик создается скриптом, relay помечает их `published_at` |
-| Load | 14.1: режим relay учтен; отдельный профиль не требуется |
+| Smoke | build, main startup without Kafka (WARN, transitions work) |
+| Unit (usecase) | envelope construction for every FR-2 type; skipping `pending`/`cancelled`/`creating`; a self-transition writes an event; a partial fee triple is omitted; received NULL omitted; traceparent in headers; occurred_at in the body and the header; producer/schema_version/key/topic; state_version |
+| Unit (storage) | validation of the traceparent context (W3C format) |
+| Integration | real PostgreSQL: a transition writes an outbox row (the body parses into PaymentEvent, headers); a version conflict - no row; a consumer chain (detected, confirming) - two rows in version order; janitor expired - a `payment.expired` row; a sink failure rolls back the transition and the journal |
+| E2E | Kafka + PostgreSQL (testcontainers): canonical events drive the payment to completed, the relay publishes `payment.events`, an external consumer sees `payment.detected`/`payment.confirming`/`payment.completed` with matching state_version and occurred_at; a duplicate record does not produce new events |
+| E2E local | compose (run instruction `test/e2e/E2E.md`, scenario E2E_Payment_Schema): after janitor events, the `outbox` contains `payment.expired`/`payment.failed` rows, the topic is created by the script, the relay marks them with `published_at` |
+| Load | 14.1: the relay mode is accounted for; a separate profile is not required |
 
-Целевое покрытие unit+integration: не ниже 80%.
+Target unit+integration coverage: at least 80%.
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Тесты вперед (usecase unit, integration-эмиссия, e2e Kafka-потребитель
-`payment.events`, секция outbox в `schema.ps1`), затем `storage/events.go`
-(sink-интерфейс, traceparent), эмиссия в `TransitionTx`, `usecase/payment_events.go`,
-обвязка consumer-а и `main` (relay), обновление AGENTS.md. Коммит
-`CBL-4.7: публикация payment.events через outbox`; спека в том же коммите.
+Tests first (usecase unit, integration emission, e2e Kafka consumer of
+`payment.events`, the outbox section in `schema.ps1`), then `storage/events.go`
+(sink interface, traceparent), emission in `TransitionTx`, `usecase/payment_events.go`,
+consumer and `main` wiring (relay), AGENTS.md update. Commit
+`CBL-4.7: publishing payment.events via outbox`; the spec is in the same commit.
 
-## 11. Открытые вопросы и решения
+## 11. Open questions and decisions
 
-- Самопереходы публикуются: событие фиксирует новую `state_version` и обновленные
-  данные (полученная сумма при повторном detected, факт продолжения набора
-  подтверждений). Альтернатива (публиковать только смену состояния) отклонена:
-  скрывает корректировки данных от ClickHouse/Notification; потребители обязаны
-  дедуплицировать по `event_id` и отбрасывать устаревшие `state_version`.
-- `cancelled` не имеет типа в CF-2 (заморожено до 4.7): событие не публикуется;
-  если Notification понадобится уведомление об отмене, тип добавляется владельцем
-  контракта (CF-3) отдельной задачей.
-- Тип для `pending` в CF-2 отсутствует осознанно: `payment.created` покрывает
-  факт готовности счета; адрес мерчант получает синхронно от 4.2 (после KI-01).
-- Ретеншен outbox и партиционирование - KI-payment-02 (14.2), как у леджера
+- Self-transitions are published: the event fixes the new `state_version` and the
+  updated data (the received amount on a repeated detected, the fact that the
+  confirmation collection continues). The alternative (publish only state changes)
+  is rejected: it hides data corrections from ClickHouse/Notification; consumers
+  must deduplicate by `event_id` and discard stale `state_version`.
+- `cancelled` has no type in CF-2 (frozen until 4.7): no event is published; if
+  Notification needs a cancellation notification, the type is added by the
+  contract owner (CF-3) in a separate task.
+- The type for `pending` is intentionally absent in CF-2: `payment.created` covers
+  the fact that the invoice is ready; the merchant receives the address
+  synchronously from 4.2 (after KI-01).
+- Outbox retention and partitioning - KI-payment-02 (14.2), as in the ledger
   (KI-ledger-09).
-- Перепроверка `completed` (4.4) после KI-01 добавит события без изменения схемы.
-- `BuildPaymentEventEnvelope` экспортирован для unit-тестов и повторного
-  использования (4.4); traceparent в него приходит уже валидированным
-  `storage.WithTraceparent` (повторная валидация в сборщике не выполняется -
-  единственная точка входа недоверенного заголовка - storage).
-- Экспорт `event_type` строкой (`payment.<state>`) и enum собираются из одной
-  функции маппинга; при добавлении состояния правится одна таблица.
-- GORM-логирование сервиса (значения в SQL при ошибках) не меняется в 4.7:
-  стиль общий для платформы, параметризованный логгер - вместе с 0.7.
+- Re-checking `completed` (4.4) after KI-01 will add events without changing the
+  schema.
+- `BuildPaymentEventEnvelope` is exported for unit tests and reuse (4.4);
+  traceparent reaches it already validated by `storage.WithTraceparent` (the
+  builder does not re-validate - the single entry point of the untrusted header is
+  storage).
+- The `event_type` string export (`payment.<state>`) and the enum are built from a
+  single mapping function; when a state is added, one table is edited.
+- GORM logging of the service (values in SQL on errors) does not change in 4.7:
+  the style is common for the platform, a parameterized logger - together with 0.7.
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (15.10.2026). Блокеров нет. MAJOR закрыты:
-AGENTS.md обновлен в этом коммите (T-PAY-07, журнал, runbook outbox,
-KI-payment-04 переформулирован: с 4.7 подделка канонического события доходит до
-реальных проводок Ledger, ACL нужен и на `payment.events`, prod запрещен до
-0.5/0.6); при пустом `KAFKA_BROKERS` добавлен WARN о накоплении событий;
-добавлены unit-тесты storage (валидация traceparent, включая injection и
-сверхдлинный заголовок); e2e-потребитель сопоставляет события по типу, не по
-позиции в батче; интеграционно проверены `payment.failed` janitor-а и реальный
-невалидный traceparent; `emitTransitionEvent` не затирает явно заданный
-traceparent; traceparent в логах consumer-а усечен `shortID` (защита от
-раздутого недоверенного заголовка); ассерты порядка по id исправлены;
-outbox-проверки в `schema.ps1` привязаны к `key` платежа.
-MINOR/NIT приняты без изменений: экспорт сборщика конверта (unit-тесты, повторное
-использование 4.4), строгость W3C-regex как в леджере (консистентность),
-отсутствие join relay-горутины при shutdown (потери исключены, возможен
-дубль - at-least-once), GORM-логирование (см. §11).
+Four independent passes (15.10.2026). No blockers. MAJOR findings closed:
+AGENTS.md updated in this commit (T-PAY-07, journal, outbox runbook,
+KI-payment-04 reformulated: since 4.7, spoofing of a canonical event reaches real
+Ledger postings, so ACL is needed on `payment.events` too, and prod is prohibited
+until 0.5/0.6); with an empty `KAFKA_BROKERS`, a WARN about event accumulation was
+added; storage unit tests were added (traceparent validation, including injection
+and an overlong header); the e2e consumer matches events by type, not by position
+in the batch; the janitor's `payment.failed` and a real invalid traceparent were
+verified in integration; `emitTransitionEvent` does not overwrite an explicitly set
+traceparent; traceparent in consumer logs is truncated with `shortID` (protection
+against a bloated untrusted header); order asserts by id were fixed; outbox checks
+in `schema.ps1` are bound to the payment `key`.
+MINOR/NIT findings accepted without changes: export of the envelope builder (unit
+tests, reuse in 4.4), W3C regex strictness as in the ledger (consistency), no join
+of the relay goroutine on shutdown (losses are excluded, a duplicate is possible -
+at-least-once), GORM logging (see §11).
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | MAJOR: батчевый порядок у потребителя в e2e; затирание `TransitionEvent.Traceparent`; неполные сценарии failed-события/сбоя sink; MINOR: комментарий traceparent, WARN без Kafka, текст лога, границы decimals, недостижимый fallback; NIT: nil-асимметрия, останов relay, хрупкость политики | сопоставление по типу события; `if event.Traceparent == ""`; тест `payment.failed`, проверка отсутствия строк при сбое; исправлено; WARN добавлен; спека выровнена по тексту; тест decimals 0/18; fallback оставлен осознанно; подтверждено; relay гасится ctx; тест валиден (комментарий) |
-| Архитектуры | MAJOR: AGENTS.md не обновлен; MINOR: правило stale state_version вне CBL-003, WARN без Kafka, затирание traceparent, порядок при репликах, отсутствие топика - в runbook; NIT: двойной маппинг state->type, сигнатура сборщика, строгость regex, неиспользуемые поля, хрупкие count в schema.ps1 | AGENTS (T-PAY-07, журнал, KI); CBL-003 дополнен правилом; WARN; исправлено; T-PAY-07; runbook; единая функция маппинга; сигнатура оставлена; консистентность с леджером; From/Traceparent - для 4.4; привязка к key |
-| С контекстом | MAJOR: шаг 7 (AGENTS, KI-02/14.2, журнал, runbook), WARN FR-5, unit-тесты storage; MINOR: затирание traceparent, текст лога, невалидный traceparent в integration, e2e без проверки лишних; NIT: self-сравнение id, экспорт сборщика, default-ветка, пустой Rate | AGENTS обновлен; WARN; `internal/storage/events_test.go`; исправлено; спека/код выровнены; тест добавлен; проверка по типам + count outbox; исправлено; решение в §11; покрыто через skip-тест; проверено |
-| Безопасности | BLOCKER нет; MAJOR: KI-payment-04 - реальный денежный канал, обновить KI/runbook/ACL на payment.events; MINOR: сырой traceparent в логах, экспорт сборщика без валидации, нестрогий regex, тихий режим без sink, WARN relay, GORM-логи; NIT: интерполяция (безопасна), join relay | KI-payment-04 обновлен (+KI-ledger-02, runbook разбора `payment.completed`); `shortID` в логах; §11 (точка валидации - storage); консистентность; осознанно (тесты без sink); WARN добавлен; §11 + 0.7; подтверждено; принято (at-least-once) |
+| No context | MAJOR: batch order at the consumer in e2e; overwriting of `TransitionEvent.Traceparent`; incomplete scenarios of a failed event/sink failure; MINOR: traceparent comment, WARN without Kafka, log text, decimals boundaries, unreachable fallback; NIT: nil asymmetry, relay shutdown, policy fragility | matching by event type; `if event.Traceparent == ""`; test `payment.failed`, check that no rows appear on failure; fixed; WARN added; the spec is aligned in text; decimals test 0/18; the fallback is kept deliberately; confirmed; the relay is stopped by ctx; the test is valid (comment) |
+| Architecture | MAJOR: AGENTS.md not updated; MINOR: stale state_version rule outside CBL-003, WARN without Kafka, overwriting traceparent, order with replicas, missing topic - in the runbook; NIT: double state->type mapping, builder signature, regex strictness, unused fields, fragile count in schema.ps1 | AGENTS (T-PAY-07, journal, KI); CBL-003 supplemented with the rule; WARN; fixed; T-PAY-07; runbook; single mapping function; signature kept; consistency with the ledger; From/Traceparent - for 4.4; binding to key |
+| With context | MAJOR: step 7 (AGENTS, KI-02/14.2, journal, runbook), WARN FR-5, storage unit tests; MINOR: overwriting traceparent, log text, invalid traceparent in integration, e2e without an extra check; NIT: self-comparison of id, builder export, default branch, empty Rate | AGENTS updated; WARN; `internal/storage/events_test.go`; fixed; spec/code aligned; test added; check by types + outbox count; fixed; decision in §11; covered via a skip test; verified |
+| Security | no BLOCKER; MAJOR: KI-payment-04 - a real money channel, update KI/runbook/ACL for payment.events; MINOR: raw traceparent in logs, builder export without validation, non-strict regex, silent mode without a sink, relay WARN, GORM logs; NIT: interpolation (safe), relay join | KI-payment-04 updated (+KI-ledger-02, runbook for investigating `payment.completed`); `shortID` in logs; §11 (the validation point is storage); consistency; deliberate (tests without a sink); WARN added; §11 + 0.7; confirmed; accepted (at-least-once) |

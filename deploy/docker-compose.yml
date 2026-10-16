@@ -70,7 +70,7 @@ services:
       METRICS_ADDR: ":9230"
       PG_DSN: postgres://cbl:cbl@postgres:5432/payment?sslmode=disable
       KAFKA_BROKERS: kafka:29092
-      # Быстрый janitor для e2e-сценариев test/e2e/schema.ps1 (локальный стенд).
+      # Fast janitor for the e2e scenarios in test/e2e/E2E.md (local stand).
       PAYMENT_JANITOR_INTERVAL: 2s
     ports:
       - "8030:8030"

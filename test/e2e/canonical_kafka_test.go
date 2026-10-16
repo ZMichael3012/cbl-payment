@@ -1,9 +1,9 @@
 //go:build e2e
 
-// Пакет e2e содержит сквозной сценарий consumer канонических событий payment:
-// события gateway.events.canonical из Kafka переводят автомат платежа в
-// PostgreSQL; дубликаты не применяются повторно, устаревшие события - no-op.
-// Стенд: реальные Kafka и PostgreSQL.
+// Package e2e contains the end-to-end scenario of the payment canonical event
+// consumer: gateway.events.canonical events from Kafka drive the payment state
+// machine in PostgreSQL; duplicates are not re-applied, stale events are no-ops.
+// Stand: real Kafka and PostgreSQL.
 package e2e
 
 import (
@@ -99,7 +99,7 @@ func setupE2EKafka(t *testing.T) []string {
 	return brokers
 }
 
-// canonicalRecord собирает Kafka-запись канонического события.
+// canonicalRecord builds a Kafka record of a canonical event.
 func canonicalRecord(t *testing.T, eventType eventsv1.CanonicalPaymentEventType, confirmations uint32) *kgo.Record {
 	t.Helper()
 	event := &eventsv1.CanonicalPaymentEvent{
@@ -126,7 +126,7 @@ func canonicalRecord(t *testing.T, eventType eventsv1.CanonicalPaymentEventType,
 	}
 }
 
-// waitForState ждет состояния платежа или падает по таймауту контекста.
+// waitForState waits for the payment state or fails on context timeout.
 func waitForState(t *testing.T, ctx context.Context, repo *storage.Repository, want domain.State) storage.Payment {
 	t.Helper()
 	for {
@@ -198,29 +198,30 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	require.NotNil(t, detectedPayment.TxID)
 	assert.Equal(t, "tx-e2e", *detectedPayment.TxID)
 
-	// Дубликат той же записи: inbox не применяет событие повторно. Проверка
-	// детерминирована порядком партиции: confirmed приходит после дубликата,
-	// поэтому лишний self-переход дубликата увеличил бы версию дважды.
+	// Duplicate of the same record: the inbox does not re-apply the event. The
+	// check is deterministic by partition order: confirmed arrives after the
+	// duplicate, so an extra self-transition from the duplicate would increment
+	// the version twice.
 	require.NoError(t, producer.ProduceSync(ctx, detected).FirstErr())
 	confirmed := canonicalRecord(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED, 3)
 	require.NoError(t, producer.ProduceSync(ctx, confirmed).FirstErr())
 	completedPayment := waitForState(t, ctx, repo, domain.StateCompleted)
 	assert.Equal(t, 3, completedPayment.Confirmations)
 	assert.Equal(t, detectedPayment.StateVersion+2, completedPayment.StateVersion,
-		"дубликат не создал лишний переход; подтверждение завершило платеж по политике")
+		"the duplicate created no extra transition; the confirmation completed the payment per policy")
 
-	// Устаревшее detected после терминального состояния - no-op.
+	// Stale detected after a terminal state is a no-op.
 	stale := canonicalRecord(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_DETECTED, 1)
 	require.NoError(t, producer.ProduceSync(ctx, stale).FirstErr())
 	waitForInboxCount(t, ctx, db, 3)
 	after, history, err := repo.Get(ctx, canonicalE2EPaymentID)
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.StateCompleted), after.State)
-	assert.Equal(t, completedPayment.StateVersion, after.StateVersion, "устаревшее событие не меняет состояние")
-	assert.Len(t, history, 6, fmt.Sprintf("история: %d", len(history)))
+	assert.Equal(t, completedPayment.StateVersion, after.StateVersion, "the stale event does not change the state")
+	assert.Len(t, history, 6, fmt.Sprintf("history: %d", len(history)))
 
-	// 4.7: переходы породили ровно четыре события (created, detected,
-	// confirming, completed); дубликат и устаревшее событие - без эффекта.
+	// 4.7: the transitions produced exactly four events (created, detected,
+	// confirming, completed); the duplicate and the stale event had no effect.
 	var outboxCount int64
 	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)
 	require.Equal(t, int64(4), outboxCount)
@@ -233,7 +234,7 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	wantVersions := map[string]uint64{
 		"payment.created": 2, "payment.detected": 4, "payment.confirming": 5, "payment.completed": 6,
 	}
-	require.Len(t, byType, 4, "ровно четыре типа событий: дубликат и устаревшее события не породили")
+	require.Len(t, byType, 4, "exactly four event types: the duplicate and the stale event produced none")
 	for eventType, record := range byType {
 		assert.Equal(t, usecase.ProducerPayment, string(recordHeader(record, outbox.HeaderProducer)))
 		assert.Equal(t, usecase.SchemaVersion, string(recordHeader(record, outbox.HeaderSchemaVersion)))
@@ -246,7 +247,7 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 		assert.Equal(t, "m-e2e", payload.GetMerchantId())
 		assert.Equal(t, string(recordHeader(record, outbox.HeaderOccurredAt)),
 			payload.GetOccurredAt().AsTime().UTC().Format(time.RFC3339Nano),
-			"заголовок occurred_at зеркалит тело")
+			"the occurred_at header mirrors the payload")
 	}
 	var completed eventsv1.PaymentEvent
 	require.NoError(t, proto.Unmarshal(byType["payment.completed"].Value, &completed))
@@ -254,7 +255,7 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	assert.Equal(t, "tx-e2e", completed.GetTxid())
 }
 
-// recordHeader возвращает значение заголовка Kafka-записи.
+// recordHeader returns the value of a Kafka record header.
 func recordHeader(record kgo.Record, key string) []byte {
 	for _, header := range record.Headers {
 		if header.Key == key {
@@ -264,7 +265,7 @@ func recordHeader(record kgo.Record, key string) []byte {
 	return nil
 }
 
-// consumePaymentEvents читает payment.events с начала топика до want записей.
+// consumePaymentEvents reads payment.events from the start of the topic until want records.
 func consumePaymentEvents(t *testing.T, ctx context.Context, brokers []string, want int) []kgo.Record {
 	t.Helper()
 	consumer, err := kgo.NewClient(
@@ -289,8 +290,8 @@ func consumePaymentEvents(t *testing.T, ctx context.Context, brokers []string, w
 	return records
 }
 
-// waitForInboxCount ждет появления ожидаемого числа inbox-строк: маркер того,
-// что consumer забрал и обработал события (sleep не верифицирует обработку).
+// waitForInboxCount waits for the expected number of inbox rows: a marker that
+// the consumer fetched and processed the events (sleep does not verify processing).
 func waitForInboxCount(t *testing.T, ctx context.Context, db *gorm.DB, want int64) {
 	t.Helper()
 	for {

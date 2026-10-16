@@ -10,47 +10,47 @@ import (
 	"time"
 )
 
-// Ошибки политики завершения платежей.
+// Errors of the payment settlement policy.
 var (
-	// ErrInvalidPolicy сообщает о некорректной конфигурации политики.
+	// ErrInvalidPolicy reports an invalid policy configuration.
 	ErrInvalidPolicy = errors.New("payment: invalid amount policy")
 )
 
-// Границы политики.
+// Policy bounds.
 const (
-	// defaultConfirmations задает порог подтверждений без настройки.
+	// defaultConfirmations defines the confirmation threshold without configuration.
 	defaultConfirmations = 6
-	// maxConfirmationsPolicy задает верхнюю границу порога подтверждений.
+	// maxConfirmationsPolicy defines the upper bound of the confirmation threshold.
 	maxConfirmationsPolicy = 1000
-	// maxToleranceBPS задает верхнюю границу толеранса (100%).
+	// maxToleranceBPS defines the upper tolerance bound (100%).
 	maxToleranceBPS = 10000
 )
 
-// Decision задает решение политики по платежу.
+// Decision defines the policy decision for a payment.
 type Decision string
 
-// Решения политики соответствуют целевым состояниям автомата.
+// Policy decisions correspond to target states of the state machine.
 const (
-	// DecisionConfirming задает продолжение набора подтверждений.
+	// DecisionConfirming defines continuation of confirmation accumulation.
 	DecisionConfirming Decision = "confirming"
-	// DecisionCompleted задает завершение платежа.
+	// DecisionCompleted defines completion of the payment.
 	DecisionCompleted Decision = "completed"
-	// DecisionUnderpaid задает недостаточную оплату.
+	// DecisionUnderpaid defines an insufficient payment.
 	DecisionUnderpaid Decision = "underpaid"
-	// DecisionOverpaid задает избыточную оплату.
+	// DecisionOverpaid defines an excess payment.
 	DecisionOverpaid Decision = "overpaid"
 )
 
-// ConfirmationTier задает ярус порога подтверждений по сумме актива.
+// ConfirmationTier defines a confirmation threshold tier by asset amount.
 type ConfirmationTier struct {
-	// BelowMinor задает верхнюю границу яруса (не включительно) в минимальных единицах.
+	// BelowMinor defines the exclusive upper bound of the tier in minor units.
 	BelowMinor int64 `json:"below_minor"`
-	// Confirmations задает порог подтверждений яруса.
+	// Confirmations defines the confirmation threshold of the tier.
 	Confirmations int `json:"confirmations"`
 }
 
-// AmountPolicy задает политику завершения: пороги подтверждений по активу и
-// сумме, толерансы недоплаты и переплаты в базисных пунктах.
+// AmountPolicy defines the settlement policy: confirmation thresholds by asset
+// and amount, underpayment and overpayment tolerances in basis points.
 type AmountPolicy struct {
 	tiers    map[string][]ConfirmationTier
 	fallback int
@@ -58,14 +58,14 @@ type AmountPolicy struct {
 	overBPS  int
 }
 
-// DefaultAmountPolicy создает политику по умолчанию: единый порог 6,
-// нулевые толерансы.
+// DefaultAmountPolicy creates the default policy: a single threshold of 6
+// and zero tolerances.
 func DefaultAmountPolicy() AmountPolicy {
 	return AmountPolicy{fallback: defaultConfirmations}
 }
 
-// ParseAmountPolicy разбирает JSON-конфигурацию порогов и толерансы.
-// Пустая строка - политика по умолчанию; ярусы сортируются по сумме.
+// ParseAmountPolicy parses the JSON configuration of thresholds and the tolerances.
+// An empty string means the default policy; tiers are sorted by amount.
 func ParseAmountPolicy(raw string, underBPS, overBPS int) (AmountPolicy, error) {
 	if underBPS < 0 || underBPS > maxToleranceBPS {
 		return AmountPolicy{}, fmt.Errorf("%w: underpaid bps %d", ErrInvalidPolicy, underBPS)
@@ -133,8 +133,8 @@ func ParseAmountPolicy(raw string, underBPS, overBPS int) (AmountPolicy, error) 
 	return policy, nil
 }
 
-// Describe возвращает детерминированное описание эффективной политики для
-// лога конфигурации при старте (без секретов).
+// Describe returns a deterministic description of the effective policy for
+// the startup configuration log (without secrets).
 func (p AmountPolicy) Describe() string {
 	assets := make([]string, 0, len(p.tiers))
 	for asset := range p.tiers {
@@ -155,9 +155,10 @@ func (p AmountPolicy) Describe() string {
 	return strings.Join(parts, ";")
 }
 
-// RequiredConfirmations возвращает порог подтверждений для ожидаемого актива и
-// суммы: первый ярус, где сумма строго меньше границы, иначе fallback.
-// Нулевое значение политики защищено значением по умолчанию.
+// RequiredConfirmations returns the confirmation threshold for the expected
+// asset and amount: the first tier where the amount is strictly below the
+// bound, otherwise the fallback. A zero policy value is protected by the
+// default value.
 func (p AmountPolicy) RequiredConfirmations(asset string, expectedMinor int64) int {
 	fallback := p.fallback
 	if fallback < 1 {
@@ -175,9 +176,9 @@ func (p AmountPolicy) RequiredConfirmations(asset string, expectedMinor int64) i
 	return fallback
 }
 
-// Decide принимает решение по оплате: недостаточная сумма определяется
-// немедленно (недоплата сверх толеранса), принятая сумма завершается при
-// достижении порога подтверждений и остается в confirming при недостатке.
+// Decide makes the settlement decision: an insufficient amount is decided
+// immediately (underpayment beyond tolerance), an accepted amount completes
+// when the confirmation threshold is reached and stays in confirming while short.
 func (p AmountPolicy) Decide(received, expected int64, confirmations, required int) Decision {
 	underLimit := expected - bpsFloor(expected, p.underBPS)
 	if received < underLimit {
@@ -200,8 +201,8 @@ func (p AmountPolicy) Decide(received, expected int64, confirmations, required i
 	return DecisionConfirming
 }
 
-// bpsFloor возвращает floor(amount * bps / 10000) без float; умножение
-// разложено на части против переполнения int64.
+// bpsFloor returns floor(amount * bps / 10000) without float; the multiplication
+// is decomposed into parts against int64 overflow.
 func bpsFloor(amount int64, bps int) int64 {
 	if bps <= 0 {
 		return 0
@@ -216,7 +217,7 @@ func bpsFloor(amount int64, bps int) int64 {
 	return result + extra
 }
 
-// validPolicyAsset проверяет код актива политики: 2 - 16 символов латиницы и цифр.
+// validPolicyAsset validates a policy asset code: 2 to 16 characters of Latin letters and digits.
 func validPolicyAsset(asset string) bool {
 	if len(asset) < 2 || len(asset) > 16 {
 		return false
@@ -229,8 +230,9 @@ func validPolicyAsset(asset string) bool {
 	return true
 }
 
-// ShouldExpire сообщает, что счет истек: срок задан и наступил, состояние
-// создано или ожидает оплату (creating не истекает - доводится 4.6).
+// ShouldExpire reports that the invoice has expired: the deadline is set and
+// reached, the state is created or awaiting payment (creating does not expire,
+// it is settled by 4.6).
 func ShouldExpire(state State, expiresAt *time.Time, now time.Time) bool {
 	if expiresAt == nil {
 		return false

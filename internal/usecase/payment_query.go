@@ -8,40 +8,40 @@ import (
 	"github.com/cbl/cbl-payment/internal/storage"
 )
 
-// ListFilter описывает фильтр списка платежей мерчанта (4.8): владелец
-// обязателен, состояние и период создания необязательны.
+// ListFilter describes the merchant payment list filter (4.8): the owner is
+// required, state and creation period are optional.
 type ListFilter struct {
-	// MerchantID задает обязательного владельца платежей.
+	// MerchantID defines the required owner of the payments.
 	MerchantID string
-	// State задает необязательный фильтр состояния.
+	// State defines the optional state filter.
 	State *domain.State
-	// CreatedFrom задает нижнюю границу периода создания включительно.
+	// CreatedFrom defines the inclusive lower bound of the creation period.
 	CreatedFrom *time.Time
-	// CreatedTo задает верхнюю границу периода создания исключительно.
+	// CreatedTo defines the exclusive upper bound of the creation period.
 	CreatedTo *time.Time
-	// Limit задает размер страницы (0 - серверный дефолт).
+	// Limit defines the page size (0 means the server default).
 	Limit int
-	// Cursor задает курсор предыдущей страницы.
+	// Cursor defines the cursor of the previous page.
 	Cursor string
 }
 
-// PaymentQuery предоставляет чтения платежей для BFF (7.4): Get с историей
-// переходов и List с фильтрами мерчанта, состояния и периода (4.8).
+// PaymentQuery provides payment reads for the BFF (7.4): Get with transition
+// history and List with merchant, state and period filters (4.8).
 type PaymentQuery struct {
 	repo *storage.Repository
 }
 
-// NewPaymentQuery создает PaymentQuery.
+// NewPaymentQuery creates a PaymentQuery.
 func NewPaymentQuery(repo *storage.Repository) *PaymentQuery {
 	return &PaymentQuery{repo: repo}
 }
 
-// Get возвращает платеж и его историю переходов.
+// Get returns the payment and its transition history.
 func (q *PaymentQuery) Get(ctx context.Context, paymentID string) (storage.Payment, []storage.Transition, error) {
 	return q.repo.Get(ctx, paymentID)
 }
 
-// List возвращает страницу платежей мерчанта и курсор продолжения.
+// List returns a page of merchant payments and the continuation cursor.
 func (q *PaymentQuery) List(ctx context.Context, filter ListFilter) ([]storage.Payment, string, error) {
 	return q.repo.List(ctx, storage.ListFilter{
 		MerchantID:  filter.MerchantID,

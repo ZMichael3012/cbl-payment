@@ -6,51 +6,51 @@ import (
 	"sort"
 )
 
-// Ошибки автомата состояний платежа.
+// Errors of the payment state machine.
 var (
-	// ErrInvalidState сообщает о неизвестном состоянии.
+	// ErrInvalidState reports an unknown state.
 	ErrInvalidState = errors.New("payment: invalid state")
-	// ErrForbiddenTransition сообщает о переходе, запрещенном матрицей.
+	// ErrForbiddenTransition reports a transition forbidden by the matrix.
 	ErrForbiddenTransition = errors.New("payment: forbidden transition")
-	// ErrTerminalState сообщает о попытке изменить терминальное состояние.
+	// ErrTerminalState reports an attempt to change a terminal state.
 	ErrTerminalState = errors.New("payment: terminal state is immutable")
-	// ErrStateConflict сообщает о конфликте версии состояния (оптимистичная блокировка).
+	// ErrStateConflict reports a state version conflict (optimistic lock).
 	ErrStateConflict = errors.New("payment: state version conflict")
 )
 
-// State задает состояние конечного автомата платежа.
+// State defines a state of the payment finite state machine.
 type State string
 
-// Канонические состояния соответствуют значениям billing.payment.v1.PaymentState
-// (CF-1): имена совпадают по нижнему регистру с суффиксами enum.
+// Canonical states correspond to billing.payment.v1.PaymentState values
+// (CF-1): the names match the enum suffixes in lower case.
 const (
-	// StateCreating - запись платежа создана, котировка фиксируется,
-	// адрес шлюза еще не получен (внешние вызовы 4.2).
+	// StateCreating - the payment record is created, the quote is being locked,
+	// the gateway address has not been received yet (external calls 4.2).
 	StateCreating State = "creating"
-	// StateCreated - котировка зафиксирована, адрес шлюза ожидается.
+	// StateCreated - the quote is locked, the gateway address is awaited.
 	StateCreated State = "created"
-	// StatePending - счет создан в шлюзе, выдан адрес, ожидается оплата.
+	// StatePending - the invoice is created at the gateway, the address is issued, payment is awaited.
 	StatePending State = "pending"
-	// StateDetected - оплата обнаружена в сети.
+	// StateDetected - the payment is detected on the network.
 	StateDetected State = "detected"
-	// StateConfirming - оплата набирает подтверждения.
+	// StateConfirming - the payment is accumulating confirmations.
 	StateConfirming State = "confirming"
-	// StateCompleted - подтверждений достаточно, платеж завершен.
+	// StateCompleted - enough confirmations, the payment is completed.
 	StateCompleted State = "completed"
-	// StateExpired - срок счета истек без оплаты.
+	// StateExpired - the invoice expired without payment.
 	StateExpired State = "expired"
-	// StateUnderpaid - оплата меньше ожидаемой суммы.
+	// StateUnderpaid - the payment is smaller than the expected amount.
 	StateUnderpaid State = "underpaid"
-	// StateOverpaid - оплата больше ожидаемой суммы.
+	// StateOverpaid - the payment is larger than the expected amount.
 	StateOverpaid State = "overpaid"
-	// StateFailed - платеж неуспешен (отказ сети или шлюза).
+	// StateFailed - the payment failed (network or gateway decline).
 	StateFailed State = "failed"
-	// StateCancelled - платеж отменен до обнаружения оплаты.
+	// StateCancelled - the payment was cancelled before payment detection.
 	StateCancelled State = "cancelled"
 )
 
-// transitions задает матрицу разрешенных переходов автомата: единственный
-// источник правил для приложения и основа для второго барьера БД (4.1).
+// transitions defines the matrix of allowed state machine transitions: the single
+// source of rules for the application and the basis for the second DB barrier (4.1).
 var transitions = map[State]map[State]struct{}{
 	StateCreating: {
 		StateCreated:   {},
@@ -83,7 +83,7 @@ var transitions = map[State]map[State]struct{}{
 	},
 }
 
-// terminalStates задает состояния без исходящих переходов.
+// terminalStates defines states without outgoing transitions.
 var terminalStates = map[State]struct{}{
 	StateCompleted: {},
 	StateExpired:   {},
@@ -93,7 +93,7 @@ var terminalStates = map[State]struct{}{
 	StateCancelled: {},
 }
 
-// ParseState разбирает строку в состояние автомата.
+// ParseState parses a string into a state machine state.
 func ParseState(raw string) (State, error) {
 	state := State(raw)
 	if _, ok := transitions[state]; ok {
@@ -105,7 +105,7 @@ func ParseState(raw string) (State, error) {
 	return "", fmt.Errorf("%w: %q", ErrInvalidState, raw)
 }
 
-// AllowedTransition сообщает, разрешен ли переход матрицей.
+// AllowedTransition reports whether the transition is allowed by the matrix.
 func AllowedTransition(from, to State) bool {
 	next, ok := transitions[from]
 	if !ok {
@@ -115,14 +115,14 @@ func AllowedTransition(from, to State) bool {
 	return ok
 }
 
-// Terminal сообщает, является ли состояние терминальным.
+// Terminal reports whether the state is terminal.
 func Terminal(state State) bool {
 	_, ok := terminalStates[state]
 	return ok
 }
 
-// ChainTo возвращает кратчайшую цепочку переходов из состояния from в to
-// по матрице автомата; пустая цепочка означает совпадение состояний.
+// ChainTo returns the shortest chain of transitions from state from to state to
+// along the state machine matrix; an empty chain means the states are equal.
 func ChainTo(from, to State) ([]State, error) {
 	if _, err := ParseState(string(from)); err != nil {
 		return nil, err
@@ -164,9 +164,9 @@ func ChainTo(from, to State) ([]State, error) {
 	return nil, fmt.Errorf("%w: %s -> %s", ErrForbiddenTransition, from, to)
 }
 
-// NextVersion проверяет переход и возвращает новую версию состояния.
-// Самопереход (обновление confirmations и т.п.) допустим только в
-// нетерминальных состояниях; терминальные состояния неизменяемы.
+// NextVersion validates the transition and returns the new state version.
+// A self-transition (updating confirmations, etc.) is allowed only in
+// non-terminal states; terminal states are immutable.
 func NextVersion(from, to State, version uint64) (uint64, error) {
 	if version == 0 {
 		return 0, fmt.Errorf("%w: zero version", ErrStateConflict)

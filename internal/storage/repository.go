@@ -17,181 +17,182 @@ import (
 	"github.com/cbl/cbl-payment/internal/domain"
 )
 
-// Ошибки storage.
+// Storage errors.
 var (
-	// ErrNotFound сообщает об отсутствии платежа.
+	// ErrNotFound reports a missing payment.
 	ErrNotFound = errors.New("payment: payment not found")
-	// ErrDuplicateKey сообщает о занятом ключе идемпотентности мерчанта.
+	// ErrDuplicateKey reports a taken merchant idempotency key.
 	ErrDuplicateKey = errors.New("payment: idempotency key already used")
-	// ErrInvalidCursor сообщает о некорректном курсоре списка платежей.
+	// ErrInvalidCursor reports an invalid payment list cursor.
 	ErrInvalidCursor = errors.New("payment: invalid cursor")
 )
 
-// Границы пагинации списка платежей и истории переходов: Get возвращает
-// последние maxTimelineTransitions записей журнала - защита от неограниченного
-// ответа при долгой жизни нетерминального платежа (self-transition confirmations).
+// Pagination bounds of the payment list and the transition history: Get returns
+// the last maxTimelineTransitions journal entries, which protects against an
+// unbounded response for a long-lived non-terminal payment (self-transition
+// confirmations).
 const (
 	defaultListLimit       = 50
 	maxListLimit           = 200
 	maxTimelineTransitions = 500
 )
 
-// Границы пакетов фоновых выборок (janitor 4.6): отдельный, более высокий
-// потолок, чем у пользовательского списка, чтобы разгребание backlog шло
-// пачками без деградации интерактивных запросов.
+// Background batch bounds (janitor 4.6): a separate, higher ceiling than the
+// user-facing list so that backlog draining proceeds in batches without
+// degrading interactive requests.
 const maxBackgroundLimit = 1000
 
-// Payment описывает строку таблицы payments.
+// Payment describes a payments table row.
 type Payment struct {
-	// ID задает UUIDv7 платежа.
+	// ID holds the payment UUIDv7.
 	ID string `gorm:"column:id;type:uuid;primaryKey"`
-	// MerchantID задает мерчанта-владельца платежа.
+	// MerchantID holds the merchant owning the payment.
 	MerchantID string `gorm:"column:merchant_id"`
-	// IdempotencyKey задает ключ идемпотентности создания.
+	// IdempotencyKey holds the creation idempotency key.
 	IdempotencyKey string `gorm:"column:idempotency_key"`
-	// RequestHash задает хэш тела запроса создания.
+	// RequestHash holds the hash of the creation request body.
 	RequestHash string `gorm:"column:request_hash"`
-	// State задает текущее состояние автомата.
+	// State holds the current state machine state.
 	State string `gorm:"column:state"`
-	// StateVersion задает монотонную версию состояния.
+	// StateVersion holds the monotonic state version.
 	StateVersion int64 `gorm:"column:state_version"`
-	// ExpectedAmount задает ожидаемую сумму в минимальных единицах.
+	// ExpectedAmount holds the expected amount in minor units.
 	ExpectedAmount int64 `gorm:"column:expected_amount"`
-	// ExpectedAsset задает актив ожидаемой суммы.
+	// ExpectedAsset holds the asset of the expected amount.
 	ExpectedAsset string `gorm:"column:expected_asset"`
-	// ExpectedDecimals задает шкалу ожидаемой суммы.
+	// ExpectedDecimals holds the scale of the expected amount.
 	ExpectedDecimals int `gorm:"column:expected_decimals"`
-	// ReceivedAmount задает полученную сумму в минимальных единицах.
+	// ReceivedAmount holds the received amount in minor units.
 	ReceivedAmount *int64 `gorm:"column:received_amount"`
-	// ReceivedAsset задает актив полученной суммы.
+	// ReceivedAsset holds the asset of the received amount.
 	ReceivedAsset *string `gorm:"column:received_asset"`
-	// ReceivedDecimals задает шкалу полученной суммы.
+	// ReceivedDecimals holds the scale of the received amount.
 	ReceivedDecimals *int `gorm:"column:received_decimals"`
-	// FeeAmount задает комиссию в минимальных единицах.
+	// FeeAmount holds the fee in minor units.
 	FeeAmount *int64 `gorm:"column:fee_amount"`
-	// FeeAsset задает актив комиссии.
+	// FeeAsset holds the fee asset.
 	FeeAsset *string `gorm:"column:fee_asset"`
-	// FeeDecimals задает шкалу комиссии.
+	// FeeDecimals holds the fee scale.
 	FeeDecimals *int `gorm:"column:fee_decimals"`
-	// QuoteID задает зафиксированную котировку курса.
+	// QuoteID holds the locked rate quote.
 	QuoteID *string `gorm:"column:quote_id"`
-	// Rate задает зафиксированный курс десятичной строкой.
+	// Rate holds the locked rate as a decimal string.
 	Rate *string `gorm:"column:rate"`
-	// QuoteLockedUntil задает срок фиксации котировки (заполняется один раз, 4.8).
+	// QuoteLockedUntil holds the quote lock deadline (filled once, 4.8).
 	QuoteLockedUntil *time.Time `gorm:"column:quote_locked_until"`
-	// PayAddress задает адрес оплаты в шлюзе.
+	// PayAddress holds the payment address at the gateway.
 	PayAddress *string `gorm:"column:pay_address"`
-	// Network задает сеть оплаты.
+	// Network holds the payment network.
 	Network string `gorm:"column:network"`
-	// GatewayID задает идентификатор платежа в шлюзе.
+	// GatewayID holds the payment identifier at the gateway.
 	GatewayID *string `gorm:"column:gateway_id"`
-	// Provider задает имя провайдера шлюза.
+	// Provider holds the gateway provider name.
 	Provider *string `gorm:"column:provider"`
-	// TxID задает хэш транзакции сети.
+	// TxID holds the network transaction hash.
 	TxID *string `gorm:"column:txid"`
-	// Confirmations задает число подтверждений сети.
+	// Confirmations holds the number of network confirmations.
 	Confirmations int `gorm:"column:confirmations"`
-	// ExpiresAt задает срок действия счета.
+	// ExpiresAt holds the invoice expiration time.
 	ExpiresAt *time.Time `gorm:"column:expires_at"`
-	// CreatedAt задает время создания.
+	// CreatedAt holds the creation time.
 	CreatedAt time.Time `gorm:"column:created_at"`
-	// UpdatedAt задает время последнего перехода.
+	// UpdatedAt holds the time of the last transition.
 	UpdatedAt time.Time `gorm:"column:updated_at"`
-	// CompletedAt задает время терминального успеха.
+	// CompletedAt holds the time of terminal success.
 	CompletedAt *time.Time `gorm:"column:completed_at"`
 }
 
-// TableName задает имя таблицы payments.
+// TableName returns the payments table name.
 func (Payment) TableName() string { return "payments" }
 
-// Transition описывает строку журнала переходов payment_transitions.
+// Transition describes a payment_transitions journal row.
 type Transition struct {
-	// ID задает порядковый номер записи журнала.
+	// ID holds the sequential journal entry number.
 	ID int64 `gorm:"column:id;primaryKey"`
-	// PaymentID задает платеж перехода.
+	// PaymentID holds the payment of the transition.
 	PaymentID string `gorm:"column:payment_id"`
-	// FromState задает состояние до перехода (пусто для создания).
+	// FromState holds the state before the transition (empty for creation).
 	FromState string `gorm:"column:from_state"`
-	// ToState задает состояние после перехода.
+	// ToState holds the state after the transition.
 	ToState string `gorm:"column:to_state"`
-	// StateVersion задает версию состояния после перехода.
+	// StateVersion holds the state version after the transition.
 	StateVersion int64 `gorm:"column:state_version"`
-	// Reason задает причину перехода (событие, запрос, фон).
+	// Reason holds the transition reason (event, request, background).
 	Reason string `gorm:"column:reason"`
-	// OccurredAt задает время перехода.
+	// OccurredAt holds the transition time.
 	OccurredAt time.Time `gorm:"column:occurred_at"`
 }
 
-// TableName задает имя таблицы payment_transitions.
+// TableName returns the payment_transitions table name.
 func (Transition) TableName() string { return "payment_transitions" }
 
-// TransitionPatch описывает изменяемые при переходе поля платежа;
-// nil-поля не изменяются.
+// TransitionPatch describes the payment fields changed by a transition;
+// nil fields are not changed.
 type TransitionPatch struct {
-	// ReceivedAmount задает полученную сумму.
+	// ReceivedAmount holds the received amount.
 	ReceivedAmount *int64
-	// ReceivedAsset задает актив полученной суммы.
+	// ReceivedAsset holds the asset of the received amount.
 	ReceivedAsset *string
-	// ReceivedDecimals задает шкалу полученной суммы.
+	// ReceivedDecimals holds the scale of the received amount.
 	ReceivedDecimals *int
-	// FeeAmount задает комиссию.
+	// FeeAmount holds the fee.
 	FeeAmount *int64
-	// FeeAsset задает актив комиссии.
+	// FeeAsset holds the fee asset.
 	FeeAsset *string
-	// FeeDecimals задает шкалу комиссии.
+	// FeeDecimals holds the fee scale.
 	FeeDecimals *int
-	// QuoteID задает котировку курса.
+	// QuoteID holds the rate quote.
 	QuoteID *string
-	// Rate задает зафиксированный курс.
+	// Rate holds the locked rate.
 	Rate *string
-	// QuoteLockedUntil задает срок фиксации котировки (fill-once, 4.8).
+	// QuoteLockedUntil holds the quote lock deadline (fill-once, 4.8).
 	QuoteLockedUntil *time.Time
-	// PayAddress задает адрес оплаты.
+	// PayAddress holds the payment address.
 	PayAddress *string
-	// GatewayID задает идентификатор платежа в шлюзе.
+	// GatewayID holds the payment identifier at the gateway.
 	GatewayID *string
-	// Provider задает провайдера шлюза.
+	// Provider holds the gateway provider.
 	Provider *string
-	// TxID задает хэш транзакции сети.
+	// TxID holds the network transaction hash.
 	TxID *string
-	// Network задает сеть оплаты из канонического события.
+	// Network holds the payment network from the canonical event.
 	Network *string
-	// Confirmations задает число подтверждений.
+	// Confirmations holds the number of confirmations.
 	Confirmations *int
-	// ExpiresAt задает срок действия счета.
+	// ExpiresAt holds the invoice expiration time.
 	ExpiresAt *time.Time
-	// CompletedAt задает время терминального успеха.
+	// CompletedAt holds the time of terminal success.
 	CompletedAt *time.Time
-	// Reason задает причину перехода для журнала.
+	// Reason holds the transition reason for the journal.
 	Reason string
 }
 
-// ListFilter описывает фильтр ListPayments.
+// ListFilter describes the ListPayments filter.
 type ListFilter struct {
-	// MerchantID задает обязательного владельца платежей.
+	// MerchantID holds the required owner of the payments.
 	MerchantID string
-	// State задает необязательный фильтр состояния.
+	// State holds the optional state filter.
 	State *domain.State
-	// CreatedFrom задает нижнюю границу периода создания включительно (4.8).
+	// CreatedFrom holds the inclusive lower bound of the creation period (4.8).
 	CreatedFrom *time.Time
-	// CreatedTo задает верхнюю границу периода создания исключительно (4.8).
+	// CreatedTo holds the exclusive upper bound of the creation period (4.8).
 	CreatedTo *time.Time
-	// Limit задает размер страницы (1 - 200, по умолчанию 50).
+	// Limit holds the page size (1 - 200, default 50).
 	Limit int
-	// Cursor задает курсор предыдущей страницы.
+	// Cursor holds the previous page cursor.
 	Cursor string
 }
 
-// Repository читает и изменяет платежи в PostgreSQL.
+// Repository reads and modifies payments in PostgreSQL.
 type Repository struct {
 	db        *gorm.DB
 	eventSink TransitionEventSink
 }
 
-// Option настраивает Repository.
+// Option configures a Repository.
 type Option func(*Repository)
 
-// NewRepository создает Repository.
+// NewRepository creates a Repository.
 func NewRepository(db *gorm.DB, opts ...Option) *Repository {
 	repo := &Repository{db: db}
 	for _, opt := range opts {
@@ -200,10 +201,11 @@ func NewRepository(db *gorm.DB, opts ...Option) *Repository {
 	return repo
 }
 
-// Create создает платеж в состоянии creating и записывает переход версии 1
-// одной транзакцией. Состояние и версия принудительно приводятся к начальным:
-// единственная точка создания - автомат (второй барьер - BEFORE INSERT триггер).
-// Занятый ключ идемпотентности возвращает ErrDuplicateKey.
+// Create creates a payment in the creating state and writes the version 1
+// transition in a single transaction. The state and version are forced to the
+// initial values: the state machine is the only creation point (the second
+// barrier is the BEFORE INSERT trigger). A taken idempotency key returns
+// ErrDuplicateKey.
 func (r *Repository) Create(ctx context.Context, payment Payment) error {
 	now := time.Now().UTC()
 	payment.State = string(domain.StateCreating)
@@ -233,15 +235,16 @@ func (r *Repository) Create(ctx context.Context, payment Payment) error {
 	return nil
 }
 
-// Transition выполняет оптимистичный переход состояния: проверяет матрицу
-// домена, обновляет платеж условием state_version = expectedVersion и пишет
-// строку журнала. Конфликт версии - domain.ErrStateConflict.
+// Transition performs an optimistic state transition: it checks the domain
+// matrix, updates the payment with the state_version = expectedVersion condition
+// and writes the journal row. A version conflict is domain.ErrStateConflict.
 func (r *Repository) Transition(ctx context.Context, id string, expectedVersion uint64, to domain.State, patch TransitionPatch) (Payment, error) {
 	return r.TransitionTx(ctx, nil, id, expectedVersion, to, patch)
 }
 
-// TransitionTx выполняет переход в переданной транзакции (tx=nil - своя):
-// consumer канонических событий пишет переход атомарно с inbox-записью Guard.
+// TransitionTx performs the transition within the given transaction (tx=nil
+// means its own): the canonical event consumer writes the transition atomically
+// with the Guard inbox record.
 func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, expectedVersion uint64, to domain.State, patch TransitionPatch) (Payment, error) {
 	db := tx
 	if db == nil {
@@ -258,7 +261,7 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 		if findErr != nil {
 			return findErr
 		}
-		if uint64(current.StateVersion) != expectedVersion { //nolint:gosec // state_version ограничен CHECK (>= 1)
+		if uint64(current.StateVersion) != expectedVersion { //nolint:gosec // state_version is constrained by CHECK (>= 1)
 			return fmt.Errorf("%w: payment %s version %d, expected %d",
 				domain.ErrStateConflict, id, current.StateVersion, expectedVersion)
 		}
@@ -266,13 +269,13 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 		if parseErr != nil {
 			return parseErr
 		}
-		newVersion, nextErr := domain.NextVersion(from, to, uint64(current.StateVersion)) //nolint:gosec // state_version ограничен CHECK
+		newVersion, nextErr := domain.NextVersion(from, to, uint64(current.StateVersion)) //nolint:gosec // state_version is constrained by CHECK
 		if nextErr != nil {
 			return nextErr
 		}
 		updates := patch.updates()
 		updates["state"] = string(to)
-		updates["state_version"] = int64(newVersion) //nolint:gosec // рост на 1 от int64-значения БД
+		updates["state_version"] = int64(newVersion) //nolint:gosec // grows by 1 from an int64 database value
 		res := tx.Model(&Payment{}).
 			Where("id = ? AND state_version = ?", id, expectedVersion).
 			Updates(updates)
@@ -286,7 +289,7 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 			PaymentID:    id,
 			FromState:    current.State,
 			ToState:      string(to),
-			StateVersion: int64(newVersion), //nolint:gosec // рост на 1 от int64-значения БД
+			StateVersion: int64(newVersion), //nolint:gosec // grows by 1 from an int64 database value
 			Reason:       patch.Reason,
 			OccurredAt:   time.Now().UTC(),
 		}
@@ -309,11 +312,11 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 	return updated, nil
 }
 
-// Get возвращает платеж и его историю переходов по возрастанию версии; история
-// ограничена последними maxTimelineTransitions записями (защита от
-// неограниченного ответа, полная история - 14.2). Обе выборки выполняются в
-// одной read-only транзакции repeatable read: конкурентный переход не должен
-// вернуть timeline новее самого платежа.
+// Get returns a payment and its transition history in ascending version order;
+// the history is limited to the last maxTimelineTransitions entries (protection
+// from an unbounded response, the full history is task 14.2). Both queries run
+// in a single read-only repeatable read transaction: a concurrent transition
+// must not return a timeline newer than the payment itself.
 func (r *Repository) Get(ctx context.Context, id string) (Payment, []Transition, error) {
 	var payment Payment
 	var history []Transition
@@ -335,20 +338,21 @@ func (r *Repository) Get(ctx context.Context, id string) (Payment, []Transition,
 	if err != nil {
 		return Payment{}, nil, fmt.Errorf("storage: get payment %s: %w", id, err)
 	}
-	// Журнал читался от новых к старым (LIMIT последних); наружу - по возрастанию.
+	// The journal was read from newest to oldest (LIMIT of the latest entries);
+	// it is returned in ascending order.
 	for left, right := 0, len(history)-1; left < right; left, right = left+1, right-1 {
 		history[left], history[right] = history[right], history[left]
 	}
 	return payment, history, nil
 }
 
-// Payment возвращает платеж без истории переходов.
+// Payment returns the payment without the transition history.
 func (r *Repository) Payment(ctx context.Context, id string) (Payment, error) {
 	return r.PaymentTx(ctx, nil, id)
 }
 
-// PaymentTx возвращает платеж без истории в переданной транзакции
-// (tx=nil - своя): consumer читает состояние в транзакции Guard.
+// PaymentTx returns the payment without the history within the given transaction
+// (tx=nil means its own): the consumer reads the state in the Guard transaction.
 func (r *Repository) PaymentTx(ctx context.Context, tx *gorm.DB, id string) (Payment, error) {
 	db := tx
 	if db == nil {
@@ -365,7 +369,7 @@ func (r *Repository) PaymentTx(ctx context.Context, tx *gorm.DB, id string) (Pay
 	return payment, nil
 }
 
-// List возвращает страницу платежей мерчанта и курсор следующей страницы.
+// List returns a page of merchant payments and the next page cursor.
 func (r *Repository) List(ctx context.Context, filter ListFilter) ([]Payment, string, error) {
 	if strings.TrimSpace(filter.MerchantID) == "" {
 		return nil, "", errors.New("storage: merchant_id is required")
@@ -411,9 +415,10 @@ func (r *Repository) List(ctx context.Context, filter ListFilter) ([]Payment, st
 	return payments, nextCursor, nil
 }
 
-// FindExpired возвращает счета с истекшим сроком без оплаты для 4.6:
-// состояние creating не включается, зависшие создания доводятся фоном
-// до created либо failed (перехода creating -> expired в матрице нет).
+// FindExpired returns unpaid invoices past their expiration for task 4.6:
+// the creating state is not included, stuck creations are brought by the
+// background to created or failed (the matrix has no creating -> expired
+// transition).
 func (r *Repository) FindExpired(ctx context.Context, before time.Time, limit int) ([]Payment, error) {
 	return r.findByFilter(ctx,
 		"state IN ? AND expires_at IS NOT NULL AND expires_at <= ?",
@@ -421,7 +426,7 @@ func (r *Repository) FindExpired(ctx context.Context, before time.Time, limit in
 		"expires_at ASC", limit)
 }
 
-// FindStuck возвращает платежи в detected/confirming без движения для 4.6.
+// FindStuck returns payments in detected/confirming without movement for task 4.6.
 func (r *Repository) FindStuck(ctx context.Context, olderThan time.Time, limit int) ([]Payment, error) {
 	return r.findByFilter(ctx,
 		"state IN ? AND updated_at <= ?",
@@ -429,9 +434,9 @@ func (r *Repository) FindStuck(ctx context.Context, olderThan time.Time, limit i
 		"updated_at ASC", limit)
 }
 
-// FindCreating возвращает зависшие создания для 4.6: платежи в creating,
-// созданные не позже порога; штатное создание (4.2) укладывается в секунды,
-// порог задает вызывающий (janitor).
+// FindCreating returns stuck creations for task 4.6: payments in creating that
+// were created at or before the threshold; a normal creation (4.2) finishes in
+// seconds, the threshold is set by the caller (janitor).
 func (r *Repository) FindCreating(ctx context.Context, olderThan time.Time, limit int) ([]Payment, error) {
 	return r.findByFilter(ctx,
 		"state = ? AND created_at <= ?",
@@ -439,8 +444,8 @@ func (r *Repository) FindCreating(ctx context.Context, olderThan time.Time, limi
 		"created_at ASC", limit)
 }
 
-// findByFilter выполняет выборку платежей по условию с ограничением пакета
-// фоновых задач (потолок maxBackgroundLimit).
+// findByFilter selects payments by condition with the background batch limit
+// (the maxBackgroundLimit ceiling).
 func (r *Repository) findByFilter(ctx context.Context, where string, args []any, order string, limit int) ([]Payment, error) {
 	if limit <= 0 {
 		limit = defaultListLimit
@@ -460,7 +465,7 @@ func (r *Repository) findByFilter(ctx context.Context, where string, args []any,
 	return payments, nil
 }
 
-// updates собирает карту изменений из непустых полей патча.
+// updates builds the change map from the non-nil patch fields.
 func (p TransitionPatch) updates() map[string]any {
 	updates := make(map[string]any, 16)
 	if p.ReceivedAmount != nil {
@@ -517,13 +522,13 @@ func (p TransitionPatch) updates() map[string]any {
 	return updates
 }
 
-// encodeCursor собирает непрозрачный курсор страницы из времени и идентификатора.
+// encodeCursor builds an opaque page cursor from the time and the identifier.
 func encodeCursor(createdAt time.Time, id string) string {
 	raw := createdAt.UTC().Format(time.RFC3339Nano) + "|" + id
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
-// decodeCursor разбирает курсор страницы и валидирует его формат.
+// decodeCursor parses a page cursor and validates its format.
 func decodeCursor(cursor string) (time.Time, string, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
@@ -544,8 +549,8 @@ func decodeCursor(cursor string) (time.Time, string, error) {
 	return createdAt.UTC(), parsed.String(), nil
 }
 
-// isUniqueViolation сообщает, что ошибка БД - занятый ключ идемпотентности
-// мерчанта (другие нарушения уникальности не маскируются).
+// isUniqueViolation reports that the database error is a taken merchant
+// idempotency key (other uniqueness violations are not masked).
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&

@@ -1,236 +1,243 @@
 # AGENTS.md - cbl-payment
 
-Автомат состояний платежа: создание счета, обработка канонических событий, пороги подтверждений.
+Payment state machine: invoice creation, canonical event processing, confirmation thresholds.
 
-Обязательные глобальные правила: `../../AGENTS.md`, `../../.specs/CBL-001-development-process.md`,
-`../../.specs/CBL-002-repos-and-docker.md`, контракты `../../.specs/CBL-003-contracts.md`.
-Длинное тире (U+2014) запрещено, используется только дефис.
+Mandatory global rules: `../../AGENTS.md`, `../../.specs/CBL-001-development-process.md`,
+`../../.specs/CBL-002-repos-and-docker.md`, contracts `../../.specs/CBL-003-contracts.md`.
+The em dash (U+2014) is forbidden, only the hyphen is used.
 
-## 1. Границы
+## 1. Boundaries
 
-In scope: конечный автомат платежа, payment.events, фоновые задачи истечения и зависших платежей.
+In scope: payment state machine, payment.events, background jobs for expiry and stuck payments.
 
-Out of scope: другие сервисы платформы; взаимодействие только через контракты `cbl-protos`
-(gRPC), Kafka и REST периметра (см. `CBL-000`, раздел 2).
+Out of scope: other platform services; interaction only via `cbl-protos` contracts
+(gRPC), Kafka and the perimeter REST (see `CBL-000`, section 2).
 
-## 2. Контракты
+## 2. Contracts
 
-- REST: административный /healthz, /readyz
-- gRPC: сервер PaymentService (GetPayment/ListPayments - 4.8; CreatePayment,
-  CancelPayment - 4.2, KI-01); клиент ConnectorService, QuoteService
-- Kafka продюсирует: payment.events (через outbox, 4.7)
-- Kafka потребляет: gateway.events.canonical (группа `cbl-payment-canonical`)
-- Хранилище: PostgreSQL payment
+- REST: administrative /healthz, /readyz
+- gRPC: server PaymentService (GetPayment/ListPayments - 4.8; CreatePayment,
+  CancelPayment - 4.2, KI-01); client ConnectorService, QuoteService
+- Kafka produces: payment.events (via outbox, 4.7)
+- Kafka consumes: gateway.events.canonical (group `cbl-payment-canonical`)
+- Storage: PostgreSQL payment
 
-Контракты заморожены в `cbl-protos` (CF-1 gRPC, CF-2/CF-3 события; поля
-котировки и чтений - `cbl-protos@cf-3.3`/`cf-3.4`, CBL-4.8), см. `CBL-004`.
+Contracts are frozen in `cbl-protos` (CF-1 gRPC, CF-2/CF-3 events; quote and
+read fields - `cbl-protos@cf-3.3`/`cf-3.4`, CBL-4.8), see `CBL-004`.
 
-## 3. Архитектура
+## 3. Architecture
 
-Слои: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
-Библиотеки: стандартный набор `CBL-002` (Gin, GORM + pgx-драйвер, franz-go + pkg/sr, go-redis,
-goose, zap). `AutoMigrate` запрещен, миграции только goose, только вперед.
-Схема (4.1): `payments` (состояние, `state_version`, суммы, реквизиты),
-`payment_transitions` (append-only журнал переходов), `outbox`, `inbox`.
-Матрица переходов - `internal/domain/state.go`, дублируется триггером БД
-(`payments_transition_guard`); переходы только через `storage.Repository.Transition`
-с CAS по `state_version`.
-Фоновые задачи (4.6) - `internal/usecase/janitor.go`: истечение счетов
-(created/pending), закрытие зависших созданий (creating -> failed), наблюдение за
-зависшими detected/confirming; выборки - по частичным индексам, пакет
+Layers: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
+Libraries: the standard `CBL-002` set (Gin, GORM + pgx driver, franz-go + pkg/sr, go-redis,
+goose, zap). `AutoMigrate` is forbidden, goose migrations only, forward only.
+Schema (4.1): `payments` (state, `state_version`, amounts, requisites),
+`payment_transitions` (append-only transition journal), `outbox`, `inbox`.
+Transition matrix - `internal/domain/state.go`, duplicated by the DB trigger
+(`payments_transition_guard`); transitions only via `storage.Repository.Transition`
+with CAS on `state_version`.
+Background jobs (4.6) - `internal/usecase/janitor.go`: invoice expiry
+(created/pending), closing stuck creations (creating -> failed), watching
+stuck detected/confirming; selections via partial indexes, batch
 `maxBackgroundLimit` 1000.
-События (4.7): каждый примененный переход (`Repository.TransitionTx`) пишет
-конверт `payment.events` в `outbox` в той же транзакции (sink -
-`internal/usecase/payment_events.go`); relay kit в `main` публикует при заданном
-`KAFKA_BROKERS` (batch 100, интервал 250 мс), без Kafka события накапливаются.
-Чтения (4.8): `internal/usecase/payment_query.go` (PaymentQuery) и
-`internal/transport/grpcserver/payment.go` (GetPayment/ListPayments); миграция
-00005 добавляет `quote_locked_until` и правило fill-once для полей котировки
-(`quote_id`, `rate`, `quote_locked_until`) в триггере перехода; история Get
-ограничена последними 500 переходами; gRPC-сервер собирается в `main` с
-`grpcmw.UnaryServer`.
+Events (4.7): every applied transition (`Repository.TransitionTx`) writes a
+`payment.events` envelope to `outbox` in the same transaction (sink -
+`internal/usecase/payment_events.go`); the kit relay in `main` publishes when
+`KAFKA_BROKERS` is set (batch 100, interval 250 ms), without Kafka events accumulate.
+Reads (4.8): `internal/usecase/payment_query.go` (PaymentQuery) and
+`internal/transport/grpcserver/payment.go` (GetPayment/ListPayments); migration
+00005 adds `quote_locked_until` and the fill-once rule for the quote fields
+(`quote_id`, `rate`, `quote_locked_until`) in the transition trigger; Get
+history is limited to the last 500 transitions; the gRPC server is assembled in
+`main` with `grpcmw.UnaryServer`.
 
-## 4. Команды
+## 4. Commands
 
 ```powershell
 make build        # go build ./...
 make test         # go test ./...
 make test-integration  # integration (testcontainers: PostgreSQL)
-make e2e          # compose-стенд: миграции, второй барьер БД, append-only журнал
-make test-e2e     # e2e на testcontainers: canonical-события Kafka -> автомат платежа
+make test-e2e     # e2e on testcontainers: canonical events Kafka -> payment state machine (no compose stand needed)
 make vet          # go vet ./...
-make lint         # golangci-lint в Docker (контекст services/)
+make lint         # golangci-lint in Docker (context services/)
 make up           # docker compose -f deploy/docker-compose.yml --profile app up -d --build
 make down         # docker compose -f deploy/docker-compose.yml down -v
 ```
 
-## 5. Порты и окружение
+Compose stand e2e runs follow the `test/e2e/E2E.md` instruction (scenario
+E2E_Payment_Schema; artifacts in `test/e2e/.runs/<mark>/`); there are no
+PowerShell run scripts.
 
-HTTP `8030`, gRPC `9030`, метрики `9230`.
-Переменные (применимые к сервису): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`
-(обязателен), `MIGRATIONS_DIR` (по умолчанию `./migrations`), `DB_MAX_OPEN_CONNS`
-(по умолчанию 20, потолок 100), `DB_MAX_IDLE_CONNS` (по умолчанию 10),
-`KAFKA_BROKERS`, `KAFKA_CONSUMER_GROUP` (по умолчанию `cbl-payment-canonical`),
-`PAYMENT_CONFIRMATION_POLICY` (JSON ярусов порогов по активу, см. 4.5),
-`PAYMENT_UNDERPAID_TOLERANCE_BPS` и `PAYMENT_OVERPAID_TOLERANCE_BPS`
-(0 - 10000, по умолчанию 0, невалидное значение - отказ старта),
-`PAYMENT_JANITOR_INTERVAL` (по умолчанию 30s, 0 - janitor выключен, минимум 1s),
-`PAYMENT_JANITOR_BATCH` (по умолчанию 100, 1 - 1000),
-`PAYMENT_CREATING_TIMEOUT` (по умолчанию 5m, минимум 1m),
-`PAYMENT_STUCK_TIMEOUT` (по умолчанию 6h, минимум 1m; невалидные значения
-janitor-переменных - отказ старта, см. 4.6),
+## 5. Ports and environment
+
+HTTP `8030`, gRPC `9030`, metrics `9230`.
+Variables (applicable to the service): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`
+(required), `MIGRATIONS_DIR` (default `./migrations`), `DB_MAX_OPEN_CONNS`
+(default 20, cap 100), `DB_MAX_IDLE_CONNS` (default 10),
+`KAFKA_BROKERS`, `KAFKA_CONSUMER_GROUP` (default `cbl-payment-canonical`),
+`PAYMENT_CONFIRMATION_POLICY` (JSON of confirmation threshold tiers per asset, see 4.5),
+`PAYMENT_UNDERPAID_TOLERANCE_BPS` and `PAYMENT_OVERPAID_TOLERANCE_BPS`
+(0 - 10000, default 0, an invalid value refuses startup),
+`PAYMENT_JANITOR_INTERVAL` (default 30s, 0 - janitor disabled, minimum 1s),
+`PAYMENT_JANITOR_BATCH` (default 100, 1 - 1000),
+`PAYMENT_CREATING_TIMEOUT` (default 5m, minimum 1m),
+`PAYMENT_STUCK_TIMEOUT` (default 6h, minimum 1m; invalid janitor variable
+values - startup refused, see 4.6),
 `SCHEMA_REGISTRY_URL`, `REDIS_ADDR`.
 
-## 6. Правила разработки
+## 6. Development rules
 
-- Конвейер: SDD-спека в `.specs/` -> архитектура -> контракты -> тесты вперед -> код ->
-  ревью 4 агентами (без контекста, архитектура, контекст, безопасность - блокирующий) ->
-  AGENTS.md -> финальные прогоны -> линтеры -> коммит.
-- Покрытие unit+integration не ниже 80%; денежные сценарии только на реальных PostgreSQL и
-  Kafka (testcontainers); локальный e2e в docker-compose обязателен.
-- Деньги только int64 в минимальных единицах плюс decimals; float запрещен.
-- Docstring на русском в стиле godoc (первая строка с имени сущности, точка в конце);
-  комментарии объясняют почему; ошибки через `%w`; панки в бизнес-коде запрещены.
-- Коммит: `CBL-<эпик>.<номер>: <краткое сообщение>`, спека с тем же префиксом в том же коммите.
+- Pipeline: SDD spec in `.specs/` -> architecture -> contracts -> tests first -> code ->
+  review by 4 agents (no-context, architecture, with-context, security - blocking) ->
+  AGENTS.md -> final runs -> linters -> commit.
+- Unit+integration coverage at least 80%; money scenarios only on real PostgreSQL and
+  Kafka (testcontainers); local e2e in docker-compose is mandatory.
+- Money only int64 in minor units plus decimals; float is forbidden.
+- Godoc docstrings are mandatory in English: the first line starts with the entity name and
+  ends with a period; comments explain why; errors are wrapped with `%w`; panics in business
+  code are forbidden.
+- Commit: `CBL-<epic>.<number>: <short message>`, the spec with the same prefix in the same commit.
 
-## 7. SLO и метрики
+## 7. SLO and metrics
 
-SLO уточняется в задаче 14.4. Базовые метрики: latency p95/p99, доля ошибок, outbox lag,
-consumer lag; дашборды после задачи 0.7.
+SLO is specified in task 14.4. Base metrics: latency p95/p99, error rate, outbox lag,
+consumer lag; dashboards after task 0.7.
 
 ## 8. Trade-offs
 
-| ID | Решение | Плюсы | Минусы и компенсация |
+| ID | Decision | Pros | Cons and compensation |
 | :-- | :-- | :-- | :-- |
-| T-PAY-01 | Матрица переходов в домене плюс два триггера БД (второй барьер): BEFORE INSERT фиксирует создание в `creating`/версии 1, BEFORE UPDATE проверяет пары состояний, инкремент `state_version`, неизменяемые поля и терминальные состояния | переходы не по порядку и создание платежа в обход автомата невозможны; аудит состояний полный | дублирование матрицы в Go и SQL, расходы триггеров на каждый переход; владелец БД может снять триггеры | матрица зеркалируется полным перебором пар в integration-тесте; цена триггера сравнима с леджером (T-LED-02); изменение правил - только миграцией; роли prod - KI-payment-03 |
-| T-PAY-02 | Оптимистичные переходы: чтение под row-локом и CAS по `state_version` | корректная история переходов, нет глобальных локов | при конкуренции на платеже один из переходов получает `ErrStateConflict` и повторяется | конфликты редки (переходы разных источников); повтор с чтением свежей версии - 4.3; метрика повторов в 0.7 |
-| T-PAY-03 | `updated_at` ведет триггер переходов | фоновые задачи (4.6) видят реальное время последнего движения | произвольное обновление `updated_at` в обход запрещено | «зависшие» определяются порогом времени, backdate не нужен |
-| T-PAY-04 | Consumer канонических событий пишет переходы в транзакции Guard (атомарно с inbox), CAS-повторы внутри транзакции (до 3) | crash-окно между эффектом и inbox исключено, повтор события не создает лишних переходов | транзакция Guard длиннее (чтение + до двух savepoint-переходов) | отличие от леджера T-LED-08 осознанно: там эффект идемпотентен бизнес-ключом, здесь откат надежнее; конфликты версии после 3 попыток уходят в retry-топики |
-| T-PAY-05 | Политика платформы (4.5) главнее классификации Connector: недоплата/переплата в пределах толеранса завершается `completed`, сверх - терминальные состояния; пороги задаются оператором в единицах актива | бизнес-решение о деньгах в одном месте (Payment), конфигурируемые пороги без релиза | двойная классификация (шлюз и платформа), расхождение с Reconciler, дрейф USD-эквивалента при ручной настройке | сверка 9.x обязана учитывать толерансы (status_mismatch не для разницы в пределах толеранса); USD-feed и fee - KI-payment-06 |
-| T-PAY-06 | Janitor в процессе сервиса (4.6): тикер, пакетные выборки по частичным индексам, CAS-переходы; без отдельного deployment-а и leader election | нет нового сервиса и его эксплуатации; работает без Kafka; выключается env-ом; несколько реплик безопасны (CAS дает один эффект) | лишние конфликты и дублирование выборок у реплик (jitter не введен осознанно); пакет последователен - долгий row-lock задерживает проход (следующий тик доводит остаток); отмена контекста обрывает проход между платежами | наблюдаемость через логи janitor (метрики - 0.7); порог риска по нагрузке - 14.6; координация реплик не требуется для корректности |
-| T-PAY-07 | События payment.events через transactional outbox (4.7): эмиссия в `Repository.TransitionTx` (та же транзакция, что переход и inbox Guard), relay kit в процессе сервиса (FOR UPDATE SKIP LOCKED, batch 100, 250 мс, публикация внутри транзакции БД - kit T-KK5) | нет потери событий при сбоях (БД-транзакция первична), Kafka не в критическом пути, at-least-once, дубли дедуплицируются `event_id` и мониторингом `state_version` (самопереходы публикуются) | при нескольких репликах порядок событий между транзакциями не гарантирован (потребители отбрасывают устаревшие `state_version`); нет топика/брокера - строки копятся, relay повторяет (WARN при старте без Kafka); GORM-логирование значений SQL - общий вопрос 0.7 | ретеншен outbox - 14.2 (KI-payment-02); метрики outbox lag - 0.7; эмиссия проверена unit/integration/e2e (Kafka), сбой sink откатывает переход |
-| T-PAY-08 | Чтения (4.8) без authN: ListPayments доверяет `merchant_id` из тела, GetPayment отдает платеж по UUID; владелец проверяется вызывающим (7.4 берет мерчанта из токена), история Get ограничена 500 переходами | BFF получает счета и timeline без межсервисной БД; ограниченный ответ не зависит от длительности жизни платежа | подмена `merchant_id`/UUID не ловится до mTLS (0.6, KI-payment-04): порт 9030 не публикуется вне доверенной сети, prod запрещен; self-transition confirmations раздувают журнал - полная история 14.2 | KI-payment-04 расширен gRPC-поверхностью; e2e фильтры и границы проверены; pagination списка клампится (50/200) |
+| T-PAY-01 | Transition matrix in the domain plus two DB triggers (second barrier): BEFORE INSERT fixes creation in `creating`/version 1, BEFORE UPDATE checks state pairs, increments `state_version`, immutable fields and terminal states | out-of-order transitions and payment creation bypassing the state machine are impossible; the state audit is complete | duplication of the matrix in Go and SQL, trigger cost on every transition; the DB owner can drop the triggers | the matrix is mirrored by full enumeration of pairs in an integration test; the trigger cost is comparable to the ledger (T-LED-02); changing the rules - only via migration; prod roles - KI-payment-03 |
+| T-PAY-02 | Optimistic transitions: read under a row lock and CAS on `state_version` | correct transition history, no global locks | under contention on one payment a transition gets `ErrStateConflict` and is retried | conflicts are rare (transitions from different sources); the retry with reading the fresh version - 4.3; the retry metric in 0.7 |
+| T-PAY-03 | `updated_at` is maintained by the transition trigger | background jobs (4.6) see the real time of the last movement | an arbitrary `updated_at` update bypassing it is forbidden | "stuck" ones are determined by a time threshold, backdate is not needed |
+| T-PAY-04 | The canonical event consumer writes transitions in the Guard transaction (atomically with inbox), CAS retries inside the transaction (up to 3) | the crash window between the effect and inbox is excluded, an event retry does not create extra transitions | the Guard transaction is longer (a read plus up to two savepoint transitions) | the difference from the ledger T-LED-08 is deliberate: there the effect is idempotent by business key, here rollback is more reliable; version conflicts after 3 attempts go to the retry topics |
+| T-PAY-05 | The platform policy (4.5) takes precedence over Connector classification: underpayment/overpayment within tolerance completes as `completed`, beyond it - terminal states; thresholds are set by the operator in asset units | the business decision about money is in one place (Payment), thresholds are configurable without a release | double classification (gateway and platform), divergence with the Reconciler, USD-equivalent drift with manual configuration | reconciliation 9.x must account for tolerances (status_mismatch not for a difference within tolerance); USD feed and fee - KI-payment-06 |
+| T-PAY-06 | Janitor in the service process (4.6): ticker, batched selections via partial indexes, CAS transitions; without a separate deployment and leader election | no new service and its operation; works without Kafka; disabled by an env; several replicas are safe (CAS gives a single effect) | extra conflicts and duplicate selections in replicas (jitter deliberately not introduced); the batch is sequential - a long row-lock delays the pass (the next tick finishes the remainder); context cancellation interrupts the pass between payments | observability via janitor logs (metrics - 0.7); the load risk threshold - 14.6; replica coordination is not required for correctness |
+| T-PAY-07 | payment.events events via the transactional outbox (4.7): emission in `Repository.TransitionTx` (the same transaction as the transition and the inbox Guard), the kit relay in the service process (FOR UPDATE SKIP LOCKED, batch 100, 250 ms, publication inside the DB transaction - kit T-KK5) | no event loss on failures (the DB transaction is primary), Kafka is not on the critical path, at-least-once, duplicates are deduplicated by `event_id` and by `state_version` monitoring (self-transitions are published) | with several replicas the event order between transactions is not guaranteed (consumers discard stale `state_version`); without a topic/broker rows accumulate, the relay retries (WARN at startup without Kafka); GORM logging of SQL values - common question 0.7 | outbox retention - 14.2 (KI-payment-02); outbox lag metrics - 0.7; emission is verified by unit/integration/e2e (Kafka), a sink failure rolls back the transition |
+| T-PAY-08 | Reads (4.8) without authN: ListPayments trusts the `merchant_id` from the body, GetPayment returns a payment by UUID; ownership is checked by the caller (7.4 takes the merchant from the token), Get history is limited to 500 transitions | the BFF gets invoices and timeline without a cross-service DB; the limited response does not depend on the payment lifetime | `merchant_id`/UUID spoofing is not caught until mTLS (0.6, KI-payment-04): port 9030 is not published outside the trusted network, prod is forbidden; self-transition confirmations bloat the journal - full history 14.2 | KI-payment-04 is extended with the gRPC surface; e2e filters and boundaries are verified; list pagination is clamped (50/200) |
 
 ## 9. Known issues
 
-| ID | Проблема | Влияние | План | Статус |
+| ID | Problem | Impact | Plan | Status |
 | :-- | :-- | :-- | :-- | :-- |
-| KI-payment-01 | CI и pre-commit не настроены | линтеры запускаются вручную | задача 0.2 | open |
-| KI-payment-02 | Нет ротации и партиционирования `payments`, `payment_transitions`, `outbox`: таблицы растут бессрочно (outbox - строка на каждый переход, 4.7) | рост БД и бэкапов; чтения по PK/индексам не страдают | ретеншен/партиционирование - задача 14.2 (как KI-ledger-09); до этого чистить published-строки вручную не разрешается (аудит) | open |
-| KI-payment-03 | Рантайм и миграции работают под одним DSN: владелец схемы может снять триггеры второго барьера (`DISABLE TRIGGER`, `session_replication_role`, `DROP TRIGGER`) | в dev-контуре второй барьер снимается владельцем БД; формально T-PAY-01 гарантирует защиту только от DML-ролей | разделить роли migrator (DDL) и runtime (DML без DDL) при выходе в prod (0.4/0.6); вне модели угроз dev-стенда | open |
-| KI-payment-04 | Топики `gateway.events.canonical` и `payment.events` не аутентифицированы: участник с produce-правами в canonical переводит платеж в detected/confirming и (с 4.5) в терминальные, а с 4.7 подтвержденный платеж публикует `payment.completed`, который Ledger 2.7 идемпотентно проводит реальными деньгами (Dr clearing / Cr merchant) без сверки со шлюзом; подделка `payment.events` напрямую подделывает проводку (кросс-ссылка KI-ledger-02). С 4.8 gRPC-чтения (9030) без authN: `ListPayments` отдает платежи любого `merchant_id` из тела, `GetPayment` - любой платеж по UUID (pay_address, txid, суммы, timeline), reflection раскрывает каталог методов | утечка produce-доступа = завершение произвольных платежей и движение денег; доступ к порту 9030 = выписка чужих адресов депозита и сумм; исправление уже проведенных - только сторно (10.x), не replay события | broker ACL и mTLS: produce в canonical только Connector, в `payment.events` только cbl-payment (0.5/0.6); gRPC mTLS и проверка владельца (7.4 берет мерчанта из токена, Get - ownership в 7.4) до mTLS 0.6; порт 9030 не публиковать вне доверенной сети, reflection отключить в prod; prod-выкладка запрещена до этого; перепроверка перед завершением - 4.4 (после KI-01); разбор подозрительного `payment.completed` - runbook | open |
-| KI-payment-05 | Too-early события опираются на номинальные retry-паузы 5s/1m/10m: с 4.6 зависшее создание закрывается `failed` через 5 минут, поэтому событие для него становится stale, а не бесконечным повтором; остаточный риск - платеж в `created` дольше ~11 минут (до реализации 4.2/4.4) уводит валидное событие в DLQ | задержка подтверждения до ручного replay | parking/replay DLQ в runbook; пересмотр бюджетов ретраев вместе с 4.2; наблюдение за `created` без движения - кандидат в 9.x | open |
-| KI-payment-06 | `fee` платежа NULL (трактуется как 0 - правила комиссии не определены, кандидат Billing API 7.x); пороги подтверждений настраиваются вручную без USD-эквивалента (feed из Quote 6.x не подключен) | недосбор комиссии; дрейф порогов при движении курса требует ручного пересмотра | правила комиссии - в 7.x; автоматический пересчет ярусов - при появлении требований бухгалтерии/14.x | open |
-| KI-payment-07 | Монотонность по `gateway_event_ts` не реализована (делегировалась 3.5/T-CONNECTOR-05): устаревшее событие из retry-контура может регрессировать `confirmations` или терминализировать платеж после более нового | редкие ложные терминальные статусы/откат счетчика до ручного разбора | сравнение времени события при хранении `gateway_event_ts` (4.x) либо перепроверка статуса 4.4 после KI-01 | open |
-| KI-payment-08 | Гонка "expired закоммичен раньше позднего detected": janitor перечитывает состояние через CAS перед истечением (реализовано 4.6), поздний `detected`/`confirmed` после `expired` consumer помечает отдельным WARN `late canonical event after expiry needs manual review` и оставляет платеж в expired - оплата требует ручного разбора/алерта | деньги в сети могут остаться незамеченными без алерта по логам | правило алерта и ремедиации - в 9.x; связанное сравнение времени - KI-payment-07 | open |
-| KI-payment-09 | Зависшее создание закрывается `failed` без обращения к шлюзу (4.6): если 4.2 успел создать invoice, но не довел платеж до `pending`, invoice остается в шлюзе без платежа | шлюз видит invoice, платеж в failed; мерчант не получал адрес, оплата невозможна | сверка 9.x классифицирует такие invoice (неоплаченный invoice без платежа); при реализации 4.2 рассмотреть отмену invoice (KI-01) | open |
+| KI-payment-01 | CI and pre-commit are not configured | linters run manually | task 0.2 | open |
+| KI-payment-02 | No rotation and partitioning of `payments`, `payment_transitions`, `outbox`: the tables grow indefinitely (outbox - one row per transition, 4.7) | DB and backup growth; reads by PK/indexes are not affected | retention/partitioning - task 14.2 (like KI-ledger-09); until then cleaning published rows manually is not allowed (audit) | open |
+| KI-payment-03 | Runtime and migrations run under the same DSN: the schema owner can drop the second-barrier triggers (`DISABLE TRIGGER`, `session_replication_role`, `DROP TRIGGER`) | in the dev circuit the second barrier is dropped by the DB owner; formally T-PAY-01 guarantees protection only from DML roles | separate the migrator (DDL) and runtime (DML without DDL) roles before going to prod (0.4/0.6); outside the dev stand threat model | open |
+| KI-payment-04 | The topics `gateway.events.canonical` and `payment.events` are not authenticated: a participant with produce rights to canonical moves a payment to detected/confirming and (since 4.5) to terminal states, and since 4.7 a confirmed payment publishes `payment.completed`, which Ledger 2.7 idempotently posts with real money (Dr clearing / Cr merchant) without checking with the gateway; forging `payment.events` directly forges the posting (cross-reference KI-ledger-02). Since 4.8 gRPC reads (9030) are without authN: `ListPayments` returns payments of any `merchant_id` from the body, `GetPayment` - any payment by UUID (pay_address, txid, amounts, timeline), reflection exposes the method catalog | a leak of produce access = completion of arbitrary payments and movement of money; access to port 9030 = a statement of others' deposit addresses and amounts; fixing already posted ones - only reversal (10.x), not event replay | broker ACL and mTLS: produce to canonical only by Connector, to `payment.events` only by cbl-payment (0.5/0.6); gRPC mTLS and ownership check (7.4 takes the merchant from the token, Get - ownership in 7.4) before mTLS 0.6; do not publish port 9030 outside the trusted network, disable reflection in prod; prod deployment is forbidden until then; re-check before completion - 4.4 (after KI-01); investigation of a suspicious `payment.completed` - runbook | open |
+| KI-payment-05 | Too-early events rely on the nominal retry pauses 5s/1m/10m: since 4.6 a stuck creation is closed as `failed` after 5 minutes, so an event for it becomes stale instead of being retried indefinitely; the residual risk - a payment in `created` for longer than ~11 minutes (until 4.2/4.4 is implemented) drives a valid event to the DLQ | confirmation delayed until manual replay | parking/replay of the DLQ in the runbook; revision of retry budgets together with 4.2; watching `created` without movement - candidate for 9.x | open |
+| KI-payment-06 | payment `fee` is NULL (treated as 0 - fee rules are not defined, candidate for Billing API 7.x); confirmation thresholds are configured manually without a USD equivalent (the feed from Quote 6.x is not connected) | fee under-collection; threshold drift as the rate moves requires manual revision | fee rules - in 7.x; automatic tier recalculation - when accounting requirements appear/14.x | open |
+| KI-payment-07 | Monotonicity by `gateway_event_ts` is not implemented (was delegated to 3.5/T-CONNECTOR-05): an outdated event from the retry loop can regress `confirmations` or terminalize a payment after a newer one | rare false terminal statuses/counter rollback until manual investigation | comparing event time when storing `gateway_event_ts` (4.x) or status re-check 4.4 after KI-01 | open |
+| KI-payment-08 | Race "`expired` committed before a late `detected`": the janitor re-reads the state via CAS before expiry (implemented in 4.6), a late `detected`/`confirmed` after `expired` is marked by the consumer with a separate WARN `late canonical event after expiry needs manual review` and the payment is left in expired - the payment requires manual investigation/alerting | money on the network may remain unnoticed without log-based alerting | the alert and remediation rule - in 9.x; the related time comparison - KI-payment-07 | open |
+| KI-payment-09 | A stuck creation is closed as `failed` without contacting the gateway (4.6): if 4.2 managed to create an invoice but did not drive the payment to `pending`, the invoice remains at the gateway without a payment | the gateway sees an invoice, the payment is failed; the merchant never received the address, payment is impossible | reconciliation 9.x classifies such invoices (an unpaid invoice without a payment); when 4.2 is implemented consider invoice cancellation (KI-01) | open |
 
-## 10. Журнал задач
+## 10. Task journal
 
-| CBL | Дата | Статус | Спека | Коммит |
+| CBL | Date | Status | Spec | Commit |
 | :-- | :-- | :-- | :-- | :-- |
-| CBL-4.1 | 2026-10-15 | done, ревью закрыто (схема payments+payment_transitions, матрица переходов в домене и БД, state_version с CAS, e2e полной цепочки, покрытие 83.5%) | `.specs/CBL-4.1-payment-schema.md` | acd3c57 |
-| CBL-4.3 | 2026-10-15 | done, ревью закрыто (consumer канонических событий в транзакции Guard, план событий с защитой от дублей и порядка, e2e Kafka) | `.specs/CBL-4.3-canonical-consumer.md` | 2d5f263 |
-| CBL-4.5 | 2026-10-15 | done, ревью закрыто (политика порогов по активу и сумме, толерансы без float, авто-завершение из consumer-а, e2e) | `.specs/CBL-4.5-confirmation-policy.md` | 0a9d627 |
-| CBL-4.6 | 2026-10-15 | done, ревью закрыто (janitor: истечение счетов, зависшие создания в failed, наблюдение за detected/confirming, пакетные выборки на частичных индексах, e2e) | `.specs/CBL-4.6-background-janitor.md` | ccb2d79 |
-| CBL-4.7 | 2026-10-15 | done, ревью закрыто (payment.events через outbox: эмиссия в TransitionTx, конверты CF-2, relay в main, traceparent-цепочка, e2e Kafka) | `.specs/CBL-4.7-payment-events-outbox.md` | eee1780 |
-| CBL-4.8 | 2026-10-15 | done, ревью закрыто (gRPC-чтения: GetPayment с котировкой/txid/confirmations/timeline, ListPayments с мерчантом, состоянием и периодом; миграция 00005 fill-once; cap timeline 500; контракты cf-3.3/cf-3.4) | `.specs/CBL-4.8-invoice-read-api.md` | этот коммит |
+| CBL-4.1 | 2026-10-15 | done, review closed (payments+payment_transitions schema, transition matrix in the domain and DB, state_version with CAS, e2e of the full chain, coverage 83.5%) | `.specs/CBL-4.1-payment-schema.md` | acd3c57 |
+| CBL-4.3 | 2026-10-15 | done, review closed (canonical event consumer in the Guard transaction, event plan with duplicate and order protection, e2e Kafka) | `.specs/CBL-4.3-canonical-consumer.md` | 2d5f263 |
+| CBL-4.5 | 2026-10-15 | done, review closed (threshold policy per asset and amount, tolerances without float, auto-completion from the consumer, e2e) | `.specs/CBL-4.5-confirmation-policy.md` | 0a9d627 |
+| CBL-4.6 | 2026-10-15 | done, review closed (janitor: invoice expiry, stuck creations to failed, watching detected/confirming, batched selections on partial indexes, e2e) | `.specs/CBL-4.6-background-janitor.md` | ccb2d79 |
+| CBL-4.7 | 2026-10-15 | done, review closed (payment.events via outbox: emission in TransitionTx, CF-2 envelopes, relay in main, traceparent chain, e2e Kafka) | `.specs/CBL-4.7-payment-events-outbox.md` | eee1780 |
+| CBL-4.8 | 2026-10-15 | done, review closed (gRPC reads: GetPayment with quote/txid/confirmations/timeline, ListPayments with merchant, state and period; migration 00005 fill-once; timeline cap 500; contracts cf-3.3/cf-3.4) | `.specs/CBL-4.8-invoice-read-api.md` | bc903bd |
+| CBL-16.6 | 2026-10-16 | done (English comments and documentation across the repository: code, tests, migrations, configs, all six specs, AGENTS.md, README; e2e runs via `test/e2e/E2E.md` with scenario `E2E_Payment_Schema`, `schema.ps1` and `make e2e` removed; validation run PASS; coverage unchanged) | `.specs/CBL-16.6-conventions.md` | this commit |
 
 ## 11. Runbook
 
-Заполняется первой продуктовой задачей сервиса. Типовые аварии: недоступность зависимости,
-рост ошибок, лаг обработки; действия: проверить health/metrics, логи с request_id, состояние
-Kafka consumer group и outbox lag, при необходимости перезапустить сервис.
+Filled in by the first product task of the service. Typical incidents: dependency
+unavailability, error growth, processing lag; actions: check health/metrics, logs with
+request_id, Kafka consumer group state and outbox lag, restart the service if needed.
 
-Автомат состояний (4.1):
+State machine (4.1):
 
-1. `ErrStateConflict` в логах: конкурентный переход на одном платеже; вызывающий повторяет
-   цикл с чтением свежей версии (`Get`). Систематика - проверить, не дублируются ли
-   канонические события (inbox 4.3).
-2. Состояние платежа и история: `SELECT state, state_version FROM payments WHERE id = '...'`;
-   полный путь переходов - `SELECT from_state, to_state, state_version, reason, occurred_at
+1. `ErrStateConflict` in logs: a concurrent transition on one payment; the caller repeats
+   the cycle with reading the fresh version (`Get`). Systematic cases - check whether
+   canonical events are duplicated (inbox 4.3).
+2. Payment state and history: `SELECT state, state_version FROM payments WHERE id = '...'`;
+   the full transition path - `SELECT from_state, to_state, state_version, reason, occurred_at
    FROM payment_transitions WHERE payment_id = '...' ORDER BY state_version`.
-3. Правка состояния напрямую в БД невозможна (триггер): исправление - только допустимый
-   переход через приложение или новая запись; `payment_transitions` append-only.
+3. Editing the state directly in the DB is impossible (trigger): fixing is only a valid
+   transition through the application or a new record; `payment_transitions` is append-only.
 
-Канонические события (4.3):
+Canonical events (4.3):
 
-1. `gateway.events.canonical.dlq`: причина в заголовке `x-error`; типовые - невалидное
-   событие (payment_id/сумма/актив/decimals, несовпадение реквизитов с ожидаемыми),
-   неизвестный платеж, too-early событие, исчерпанные конфликты версии. Повтор после
-   исправления причины - ручной replay из DLQ (KI-payment-05).
-2. Лаг consumer `cbl-payment-canonical`: проверить логи `canonical event applied`,
-   `stale canonical event skipped`, конфликты (`conflict_retry`), состояние БД.
-3. Событие пришло до `pending` (too early): платеж долго в creating/created; проверить
-   4.2/4.6, после перевода платежа в pending событие ретраится из retry-топиков.
-4. Границы доверия топика - KI-payment-04: продюсеры должны быть только из доверенной
-   сети (ACL/mTLS - 0.5/0.6); с 4.5 подделанное `confirmed` может завершить платеж.
+1. `gateway.events.canonical.dlq`: the reason is in the `x-error` header; typical ones - an
+   invalid event (payment_id/amount/asset/decimals, requisites mismatch with the expected
+   ones), an unknown payment, a too-early event, exhausted version conflicts. Retry after
+   fixing the cause - manual replay from the DLQ (KI-payment-05).
+2. Consumer lag `cbl-payment-canonical`: check logs `canonical event applied`,
+   `stale canonical event skipped`, conflicts (`conflict_retry`), DB state.
+3. An event arrived before `pending` (too early): the payment stays in creating/created for
+   a long time; check 4.2/4.6, after the payment is moved to pending the event is retried
+   from the retry topics.
+4. Topic trust boundaries - KI-payment-04: producers must be from the trusted network only
+   (ACL/mTLS - 0.5/0.6); since 4.5 a forged `confirmed` can complete the payment.
 
-Политика завершения (4.5):
+Completion policy (4.5):
 
-1. Эффективные пороги и толерансы печатаются при старте (`payment amount policy
-   configured`); при инциденте сверить конфигурацию именно этого запуска.
-2. `PAYMENT_CONFIRMATION_POLICY` меняется только с рестартом сервиса; после правки
-   ярусов проверить лог старта и тестовый платеж.
-3. Платеж завершается consumer-ом при `confirmations >= required` и сумме в
-   толерансе; расхождение с классификацией шлюза в пределах толеранса штатно
-   (T-PAY-05) - не считать расхождением сверки.
-4. Истечение выполняет 4.6 через `ShouldExpire`; поздний detected после `expired` -
-   ручной разбор (KI-payment-08).
+1. Effective thresholds and tolerances are printed at startup (`payment amount policy
+   configured`); during an incident verify the configuration of exactly this run.
+2. `PAYMENT_CONFIRMATION_POLICY` changes only with a service restart; after editing
+   the tiers check the startup log and a test payment.
+3. The payment is completed by the consumer at `confirmations >= required` and the amount
+   within tolerance; divergence with the gateway classification within tolerance is normal
+   (T-PAY-05) - do not count it as a reconciliation mismatch.
+4. Expiry is performed by 4.6 via `ShouldExpire`; a late detected after `expired` -
+   manual investigation (KI-payment-08).
 
-Фоновые задачи (4.6):
+Background jobs (4.6):
 
-1. Конфигурация печатается при старте (`payment janitor started`): интервал,
-   пакет, `creating_timeout`, `stuck_timeout`; при `PAYMENT_JANITOR_INTERVAL=0` -
-   `payment janitor disabled`. Опечатка в значениях блокирует старт, а не
-   деградирует молча.
-2. Причины переходов janitor-а в журнале: `janitor expired` (created/pending ->
-   expired) и `janitor creating timeout` (creating -> failed, по умолчанию через
-   5m). Свежие создания не трогаются; failure зависшего создания ограничивает
-   окно too-early событий (KI-payment-05).
-3. `janitor: sweep finished` с ненулевыми счетчиками - разбор: `conflicts` -
-   нормальная гонка нескольких реплик; рост `errors` - смотреть БД/логи;
-   `stuck` > 0 - WARN `janitor: payment without movement` (платеж без движения
-   дольше `PAYMENT_STUCK_TIMEOUT`, деньги в сети): вручную посмотреть статус
-   шлюза (4.4 после KI-01), дождаться сверки 9.x; автоматически janitor
-   detected/confirming не терминализирует.
-4. Backlog (много истекших/зависших): проходы идут пакетами, число за проход -
-   `PAYMENT_JANITOR_BATCH`; при устойчивом backlog увеличить batch/уменьшить
-   интервал, проверить, почему не работает consumer канонических событий.
+1. Configuration is printed at startup (`payment janitor started`): interval,
+   batch, `creating_timeout`, `stuck_timeout`; with `PAYMENT_JANITOR_INTERVAL=0` -
+   `payment janitor disabled`. A typo in the values blocks startup instead of
+   silently degrading.
+2. Janitor transition reasons in the journal: `janitor expired` (created/pending ->
+   expired) and `janitor creating timeout` (creating -> failed, by default after
+   5m). Fresh creations are not touched; failing a stuck creation limits
+   the window of too-early events (KI-payment-05).
+3. `janitor: sweep finished` with non-zero counters - investigation: `conflicts` -
+   a normal race of several replicas; growth of `errors` - look at the DB/logs;
+   `stuck` > 0 - WARN `janitor: payment without movement` (a payment without movement
+   longer than `PAYMENT_STUCK_TIMEOUT`, money on the network): manually check the
+   gateway status (4.4 after KI-01), wait for reconciliation 9.x; the janitor
+   does not terminalize detected/confirming automatically.
+4. Backlog (many expired/stuck): passes go in batches, the number per pass -
+   `PAYMENT_JANITOR_BATCH`; with a sustained backlog increase the batch/decrease the
+   interval, check why the canonical event consumer is not working.
 5. `late canonical event after expiry needs manual review` (consumer 4.3, WARN):
-   оплата по уже истекшему счету - деньги в сети, ручной разбор (KI-payment-08).
+   payment against an already expired invoice - money on the network, manual
+   investigation (KI-payment-08).
 
-События payment.events (4.7):
+payment.events events (4.7):
 
 1. Outbox lag: `SELECT count(*), min(created_at) FROM outbox WHERE published_at IS
-   NULL`; логи relay `outbox published batch` / `outbox publish batch failed`.
-   Потери невозможны: неопубликованные строки ждут топик/брокера и уходят
-   следующими циклами; возможны дубли (at-least-once, потребители дедуплицируют
-   по `event_id`).
-2. Публикация не идут без топика: топик `payment.events` должен существовать
-   (`deploy/kafka/init-topics.sh` в глобальном стенде, 0.5); без `KAFKA_BROKERS`
-   сервис пишет `payment events accumulate in outbox` и копит строки.
-3. События одного платежа проверяются по `state_version`/`event_type`
+   NULL`; relay logs `outbox published batch` / `outbox publish batch failed`.
+   Losses are impossible: unpublished rows wait for the topic/broker and go out
+   in the next cycles; duplicates are possible (at-least-once, consumers deduplicate
+   by `event_id`).
+2. Publications do not happen without a topic: the topic `payment.events` must exist
+   (`deploy/kafka/init-topics.sh` in the global stand, 0.5); without `KAFKA_BROKERS`
+   the service writes `payment events accumulate in outbox` and accumulates rows.
+3. Events of one payment are verified by `state_version`/`event_type`
    (`SELECT event_id, headers->>'event_type' FROM outbox WHERE "key" = '<payment_id>'
-   ORDER BY id`); устаревшие события - норма (переходы разных источников),
-   ретеншен - KI-payment-02 (14.2).
-4. Подозрительный `payment.completed` (KI-payment-04): подтвердить легитимность
-   канонического события/платежа до проводки; если проводка уже прошла -
-   исправление только сторно (10.x), не повтор события; инцидент - с разбором
-   produce-доступа к топикам.
+   ORDER BY id`); stale events are normal (transitions from different sources),
+   retention - KI-payment-02 (14.2).
+4. A suspicious `payment.completed` (KI-payment-04): confirm the legitimacy of the
+   canonical event/payment before the posting; if the posting has already happened -
+   fixing is only reversal (10.x), not event repetition; the incident - with an
+   investigation of produce access to the topics.
 
-Чтения (4.8):
+Reads (4.8):
 
-1. `payment_not_found` (NotFound) на GetPayment: UUID корректен, но платежа нет
-   (или он еще не создан 4.2 - CreatePayment недоступен до KI-01).
+1. `payment_not_found` (NotFound) on GetPayment: the UUID is correct but the payment
+   does not exist (or has not been created yet 4.2 - CreatePayment is unavailable until KI-01).
 2. `invalid_query`/`invalid_period`/`invalid_cursor` (InvalidArgument):
-   пустой/длинный `merchant_id`, неизвестный `state_filter`, границы периода
-   (to не позже from, метка вне диапазона protobuf), курсор не из
+   an empty/long `merchant_id`, an unknown `state_filter`, period boundaries
+   (to not later than from, a mark outside the protobuf range), a cursor not from
    `next_cursor`.
-3. Пустой список ListPayments - норма для чужого/неизвестного мерчанта
-   (сравнение с ожидаемым `merchant_id` из токена - обязанность 7.4).
-4. GetPayment отдает последние 500 переходов: усеченный timeline на
-   долгоживущем нетерминальном платеже - ожидаемо (полная история - 14.2;
-   рост журнала от self-transition confirmations - KI-payment-07).
-5. Прямой доступ к 9030 вне доверенной сети запрещен (KI-payment-04): выписка
-   чужого мерчанта подменой `merchant_id`; mTLS/ownership - 7.4, 0.6.
+3. An empty ListPayments list - normal for a foreign/unknown merchant
+   (comparison with the expected `merchant_id` from the token is 7.4's responsibility).
+4. GetPayment returns the last 500 transitions: a truncated timeline on a
+   long-lived non-terminal payment is expected (full history - 14.2;
+   journal growth from self-transition confirmations - KI-payment-07).
+5. Direct access to 9030 outside the trusted network is forbidden (KI-payment-04):
+   a statement of another merchant by spoofing `merchant_id`; mTLS/ownership - 7.4, 0.6.

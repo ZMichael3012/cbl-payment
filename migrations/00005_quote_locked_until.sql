@@ -1,9 +1,9 @@
 -- +goose Up
--- Поля котировки счета мерчанта (4.8): срок фиксации курса. rate и quote_id
--- уже есть с 4.1; здесь добавляется locked_until, а правила неизменяемости
--- распространяются на все поля котировки в режиме «fill-once»: пока значение
--- NULL, переход может его заполнить (создание/фиксация котировки 4.2), после
--- заполнения изменение запрещено.
+-- Merchant invoice quote fields (4.8): rate lock expiration. rate and quote_id
+-- already exist since 4.1; this migration adds locked_until, and the immutability
+-- rules extend to all quote fields in fill-once mode: while a value is NULL,
+-- a transition may fill it (invoice creation/quote lock at 4.2); once filled,
+-- changing it is forbidden.
 ALTER TABLE payments ADD COLUMN quote_locked_until timestamptz;
 
 -- +goose StatementBegin
@@ -28,8 +28,8 @@ BEGIN
         RAISE EXCEPTION 'payments: state_version must increment by 1 (got % -> %)',
             OLD.state_version, NEW.state_version;
     END IF;
-    -- Самопереход (обновление confirmations и т.п.) допустим только в нетерминальных
-    -- состояниях; терминальные состояния неизменяемы.
+    -- A self-transition (confirmations update and so on) is allowed only in
+    -- non-terminal states; terminal states are immutable.
     IF NEW.state = OLD.state THEN
         IF OLD.state IN ('completed', 'expired', 'underpaid', 'overpaid', 'failed', 'cancelled') THEN
             RAISE EXCEPTION 'payments: terminal state % is immutable', OLD.state;
@@ -72,8 +72,8 @@ BEGIN
         RAISE EXCEPTION 'payments: state_version must increment by 1 (got % -> %)',
             OLD.state_version, NEW.state_version;
     END IF;
-    -- Самопереход (обновление confirmations и т.п.) допустим только в нетерминальных
-    -- состояниях; терминальные состояния неизменяемы.
+    -- A self-transition (confirmations update and so on) is allowed only in
+    -- non-terminal states; terminal states are immutable.
     IF NEW.state = OLD.state THEN
         IF OLD.state IN ('completed', 'expired', 'underpaid', 'overpaid', 'failed', 'cancelled') THEN
             RAISE EXCEPTION 'payments: terminal state % is immutable', OLD.state;

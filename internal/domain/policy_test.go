@@ -25,11 +25,11 @@ func TestAmountPolicyRequiredConfirmations(t *testing.T) {
 	t.Parallel()
 
 	policy := mustPolicy(t, policyJSON, 0, 0)
-	assert.Equal(t, 1, policy.RequiredConfirmations("USDT", 9_999), "первый ярус: менее 100.00")
-	assert.Equal(t, 3, policy.RequiredConfirmations("USDT", 10_000), "граница яруса переходит к следующему")
+	assert.Equal(t, 1, policy.RequiredConfirmations("USDT", 9_999), "first tier: less than 100.00")
+	assert.Equal(t, 3, policy.RequiredConfirmations("USDT", 10_000), "a tier boundary moves to the next tier")
 	assert.Equal(t, 3, policy.RequiredConfirmations("usdt", 99_999))
-	assert.Equal(t, 6, policy.RequiredConfirmations("USDT", 100_000), "выше ярусов - fallback")
-	assert.Equal(t, 6, policy.RequiredConfirmations("BTC", 1), "актив без ярусов - fallback")
+	assert.Equal(t, 6, policy.RequiredConfirmations("USDT", 100_000), "above the tiers - fallback")
+	assert.Equal(t, 6, policy.RequiredConfirmations("BTC", 1), "asset without tiers - fallback")
 }
 
 func TestAmountPolicyDecide(t *testing.T) {
@@ -69,10 +69,10 @@ func TestAmountPolicyHugeAmountNoOverflow(t *testing.T) {
 	t.Parallel()
 
 	policy := mustPolicy(t, "", 10_000, 10_000)
-	// При сумме около предела int64 границы не переполняются.
+	// With an amount near the int64 limit the bounds do not overflow.
 	assert.Equal(t, domain.DecisionCompleted, policy.Decide(1<<62, 1<<62, 1, 1))
 	assert.Equal(t, domain.DecisionCompleted, policy.Decide(0, 1<<62, 1, 1),
-		"100% толеранс принимает любую полученную сумму")
+		"a 100% tolerance accepts any received amount")
 
 	strict := mustPolicy(t, "", 0, 0)
 	assert.Equal(t, domain.DecisionUnderpaid, strict.Decide(0, 1<<62, 1, 1))
@@ -109,9 +109,9 @@ func TestParseAmountPolicyErrors(t *testing.T) {
 	}
 
 	policy := mustPolicy(t, "", 0, 0)
-	assert.Equal(t, 6, policy.RequiredConfirmations("USDT", 1), "пустая конфигурация - политика по умолчанию")
+	assert.Equal(t, 6, policy.RequiredConfirmations("USDT", 1), "empty configuration - the default policy")
 
-	// Ключ "Default" нормализуется в fallback; описание политики детерминировано.
+	// The "Default" key is normalized into the fallback; the policy description is deterministic.
 	described := mustPolicy(t, `{"usdt":[{"below_minor":100,"confirmations":2}],"Default":7}`, 50, 10)
 	assert.Equal(t, 7, described.RequiredConfirmations("USDT", 1_000))
 	assert.Equal(t, 2, described.RequiredConfirmations("USDT", 50))
@@ -124,7 +124,7 @@ func TestAmountPolicyZeroValueGuard(t *testing.T) {
 	t.Parallel()
 
 	var empty domain.AmountPolicy
-	assert.Equal(t, 6, empty.RequiredConfirmations("USDT", 1), "нулевая политика не завершает без подтверждений")
+	assert.Equal(t, 6, empty.RequiredConfirmations("USDT", 1), "a zero policy does not complete without confirmations")
 	assert.Equal(t, 6, empty.RequiredConfirmations("USDT", 1_000_000))
 }
 
@@ -137,11 +137,11 @@ func TestShouldExpire(t *testing.T) {
 
 	assert.True(t, domain.ShouldExpire(domain.StatePending, &past, now))
 	assert.True(t, domain.ShouldExpire(domain.StateCreated, &past, now))
-	assert.True(t, domain.ShouldExpire(domain.StatePending, &now, now), "граница равенства: expires_at == now истекает")
+	assert.True(t, domain.ShouldExpire(domain.StatePending, &now, now), "boundary equality: expires_at == now expires")
 	assert.False(t, domain.ShouldExpire(domain.StateCreated, &future, now))
-	assert.False(t, domain.ShouldExpire(domain.StatePending, nil, now), "без срока истечения нет")
-	assert.False(t, domain.ShouldExpire(domain.StateCreating, &past, now), "creating доводится фоном")
-	assert.False(t, domain.ShouldExpire(domain.StateDetected, &past, now), "оплата обнаружена - не истекает")
+	assert.False(t, domain.ShouldExpire(domain.StatePending, nil, now), "without a deadline there is no expiry")
+	assert.False(t, domain.ShouldExpire(domain.StateCreating, &past, now), "creating is settled by the background task")
+	assert.False(t, domain.ShouldExpire(domain.StateDetected, &past, now), "payment detected - does not expire")
 	assert.False(t, domain.ShouldExpire(domain.StateConfirming, &past, now))
 	assert.False(t, domain.ShouldExpire(domain.StateCompleted, &past, now))
 }

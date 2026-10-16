@@ -9,7 +9,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/domain"
 )
 
-// eventCycles задает ожидаемые планы FR-2: состояния -> событие -> результат.
+// eventCycles defines the expected FR-2 plans: state -> event -> result.
 var eventCycles = map[domain.State]map[domain.CanonicalEventType][]domain.State{
 	domain.StateCreating: nil,
 	domain.StateCreated:  nil,
@@ -60,7 +60,7 @@ func TestPlanEvent(t *testing.T) {
 			}
 			if domain.Terminal(current) {
 				require.NoErrorf(t, err, "%s + %s", current, event)
-				assert.Emptyf(t, plan, "%s + %s: терминальное состояние - no-op", current, event)
+				assert.Emptyf(t, plan, "%s + %s: terminal state is a no-op", current, event)
 				continue
 			}
 			require.NoErrorf(t, err, "%s + %s", current, event)
@@ -72,7 +72,7 @@ func TestPlanEvent(t *testing.T) {
 func TestPlanEventValidChains(t *testing.T) {
 	t.Parallel()
 
-	// Каждая построенная цепочка обязана проходить матрицу переходов 4.1.
+	// Every built chain must pass the 4.1 transition matrix.
 	for _, current := range allStates {
 		for _, event := range allEventTypes {
 			plan, err := domain.PlanEvent(current, event)
@@ -98,5 +98,5 @@ func TestPlanEventUnknownType(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrUnknownEvent)
 
 	_, err = domain.PlanEvent(domain.StateCompleted, "mystery")
-	require.ErrorIs(t, err, domain.ErrUnknownEvent, "неизвестный тип отвергается и для терминальных состояний")
+	require.ErrorIs(t, err, domain.ErrUnknownEvent, "an unknown type is rejected for terminal states as well")
 }

@@ -1,165 +1,168 @@
-# CBL-4.8. gRPC-чтения Payment для счета мерчанта
+# CBL-4.8. Payment gRPC reads for the merchant invoice
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E4 (Payment) |
-| Репозиторий | `cbl-payment` (+ контракт `cbl-protos@cf-3.3`) |
-| Размер | S |
-| Волна | W3-BILLING (предпосылка 7.4, FR-8 спеки CBL-7.1) |
-| Зависит от | 4.1 (схема), CF-3, тег `cbl-protos@cf-3.3` |
-| Статус | done, ревью закрыто |
+| Epic | E4 (Payment) |
+| Repository | `cbl-payment` (+ contract `cbl-protos@cf-3.3`) |
+| Size | S |
+| Wave | W3-BILLING (prerequisite of 7.4, FR-8 of the CBL-7.1 spec) |
+| Depends on | 4.1 (schema), CF-3, tag `cbl-protos@cf-3.3` |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Ревью 7.1 показало: REST-инвойс мерчанта (`quote{rate, locked_until}`, фильтры
-списка, `pay_amount`/`pay_asset`) не имел источника в Payment gRPC: сообщение
-`Payment` не несло курс и срок фиксации, `ListPayments` - период, а сами
-чтения (`GetPayment`/`ListPayments`) не были реализованы вовсе. 4.8 добавляет
-аддитивные поля контракта (`cbl-protos` `CBL-4.8`, тег `cf-3.3`) и реализует
-чтения поверх схемы 4.1. `CreatePayment`/`CancelPayment` остаются в 4.2
-(блокировка KI-01, шлюз): 7.4 стартует после 4.2, 2.10 и 4.8.
+The 7.1 review showed: the merchant REST invoice (`quote{rate, locked_until}`, list
+filters, `pay_amount`/`pay_asset`) had no source in Payment gRPC: the `Payment`
+message did not carry the rate and the lock period, `ListPayments` did not carry the
+period, and the reads themselves (`GetPayment`/`ListPayments`) were not implemented
+at all. 4.8 adds additive contract fields (`cbl-protos` `CBL-4.8`, tag `cf-3.3`) and
+implements the reads over the 4.1 schema. `CreatePayment`/`CancelPayment` remain in
+4.2 (blocked by KI-01, the gateway): 7.4 starts after 4.2, 2.10 and 4.8.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: gRPC-сервер PaymentService (`GetPayment`, `ListPayments`), поля
-котировки, период списка, миграция `quote_locked_until`. Out of scope:
-`CreatePayment`/`CancelPayment` (4.2), фиксация котировки при создании (4.2
-заполняет `rate`/`locked_until`), перепроверка статуса шлюза (4.4), REST
-Billing API (7.4).
+In scope: the gRPC server PaymentService (`GetPayment`, `ListPayments`), quote
+fields, the list period, the `quote_locked_until` migration. Out of scope:
+`CreatePayment`/`CancelPayment` (4.2), fixing the quote at creation (4.2 fills
+`rate`/`locked_until`), re-checking the gateway status (4.4), Billing API REST
+(7.4).
 
-## 3. Контракт (cf-3.3 и cf-3.4)
+## 3. Contract (cf-3.3 and cf-3.4)
 
 - `Payment` + `rate = 13`, `locked_until = 14` (cf-3.3), `txid = 15`,
   `confirmations = 16` (cf-3.4); `CreatePaymentResponse` + `rate = 6`,
-  `locked_until = 7` (cf-3.3), `expected_amount = 8` (cf-3.4 - источник
-  `pay_amount`/`pay_asset` ответа 201).
-- `ListPaymentsRequest` + `created_from = 5`, `created_to = 6` (по `created_at`
-  транзакции: from включительно, to исключительно); курсор - непрозрачное
-  значение `next_cursor` предыдущего ответа.
-- `pay_amount`/`pay_asset` чтений выводятся из `expected_amount` (`Money` с
-  активом); `fee` в `Payment` не выносится (правила комиссии - KI-payment-06,
-  отдельного REST-поля fee в инвойсе нет - webhook-поле питается
+  `locked_until = 7` (cf-3.3), `expected_amount = 8` (cf-3.4 - the source of
+  `pay_amount`/`pay_asset` in the 201 response).
+- `ListPaymentsRequest` + `created_from = 5`, `created_to = 6` (by the transaction
+  `created_at`: from inclusive, to exclusive); the cursor is the opaque
+  `next_cursor` value of the previous response.
+- `pay_amount`/`pay_asset` of the reads are derived from `expected_amount` (`Money`
+  with an asset); `fee` is not exposed in `Payment` (fee rules - KI-payment-06,
+  there is no separate REST fee field in the invoice - the webhook field is fed by
   `payment.events`).
 
-## 4. Функциональные требования
+## 4. Functional requirements
 
-FR-1. `GetPayment`: платеж по `payment_id` (UUID) с историей переходов
-(`timeline`: состояние, время, причина) и полями котировки (`quote_id`, `rate`,
-`locked_until`), суммами (`expected_amount`, `received_amount`), адресом, сетью,
-`txid`, `expires_at`; неизвестный id - `NotFound` (`payment_not_found`).
+FR-1. `GetPayment`: the payment by `payment_id` (UUID) with the transition history
+(`timeline`: state, time, reason) and quote fields (`quote_id`, `rate`,
+`locked_until`), amounts (`expected_amount`, `received_amount`), address, network,
+`txid`, `expires_at`; an unknown id - `NotFound` (`payment_not_found`).
 
-FR-2. `ListPayments`: обязательный `merchant_id` (владелец из токена в 7.4);
-фильтры `state_filter` (UNSPECIFIED - нет фильтра, неизвестное значение -
-`InvalidArgument`), `created_from`/`created_to` (границы включительно и
-исключительно), курсор `payment_id` предыдущей страницы (порядок
-`created_at DESC, id DESC`), limit 1 - 200 (дефолт 50); timeline в списке не
-заполняется.
+FR-2. `ListPayments`: mandatory `merchant_id` (the owner from the token in 7.4);
+filters `state_filter` (UNSPECIFIED - no filter, an unknown value -
+`InvalidArgument`), `created_from`/`created_to` (inclusive and exclusive
+boundaries), the cursor `payment_id` of the previous page (order
+`created_at DESC, id DESC`), limit 1 - 200 (default 50); the timeline is not
+filled in the list.
 
-FR-3. Хранилище: `ListFilter` дополняется периодом; прямой `INSERT` в тестах
-допускает backdate `created_at` (immutable только для UPDATE); невалидный
-курсор - `ErrInvalidCursor` (sentinel), неизвестный платеж - `ErrNotFound`.
+FR-3. Storage: `ListFilter` is extended with the period; a direct `INSERT` in
+tests allows backdating `created_at` (immutable for UPDATE only); an invalid
+cursor - `ErrInvalidCursor` (sentinel), an unknown payment - `ErrNotFound`.
 
-FR-4. Миграция 00005: колонка `quote_locked_until timestamptz`; триггер
-`payments_transition_guard` пересоздается с правилом «fill-once» для полей
-котировки (`quote_id`, `rate`, `quote_locked_until`): пока значение NULL,
-переход может его заполнить; после заполнения изменение запрещено (миграция
-вперед-совместима, Down восстанавливает прежнее тело).
+FR-4. Migration 00005: column `quote_locked_until timestamptz`; the trigger
+`payments_transition_guard` is recreated with a "fill-once" rule for the quote
+fields (`quote_id`, `rate`, `quote_locked_until`): while a value is NULL, a
+transition may fill it; after it is filled, modification is forbidden (the
+migration is forward-compatible, Down restores the previous body).
 
-FR-5. Транспорт: валидация недоверенного ввода до хранилища (UUID, обязательный
-`merchant_id` и его длина, значение enum, валидность `Timestamp` через
-`CheckValid`, длина курсора, порядок границ); сервер регистрируется в main с
-`grpcmw.UnaryServer`; `CreatePayment`/`CancelPayment` - `Unimplemented` до 4.2.
+FR-5. Transport: validation of untrusted input before storage (UUID, mandatory
+`merchant_id` and its length, enum value, `Timestamp` validity via `CheckValid`,
+cursor length, boundary order); the server is registered in main with
+`grpcmw.UnaryServer`; `CreatePayment`/`CancelPayment` - `Unimplemented` until 4.2.
 
-FR-6. Тесты: unit - валидация, маппинг состояний (11 значений + неизвестные),
-`mapPaymentError`; integration storage - round-trip котировки, fill-once запрет
-перезаписи и разрешение позднего заполнения, период/курсор/изоляция мерчантов;
-integration bufconn - `GetPayment` (rate/locked_until/timeline) и `ListPayments`
-(фильтры, пагинация, границы), `NotFound`; e2e compose - grpcurl-проверки
-чтений на реальном сервере.
+FR-6. Tests: unit - validation, state mapping (11 values + unknown),
+`mapPaymentError`; integration storage - quote round-trip, fill-once forbids
+overwriting and allows late filling, period/cursor/merchant isolation;
+integration bufconn - `GetPayment` (rate/locked_until/timeline) and `ListPayments`
+(filters, pagination, boundaries), `NotFound`; e2e compose - grpcurl checks of the
+reads against the real server.
 
-## 5. Проверки
+## 5. Checks
 
-| Проверка | Команда | Результат |
+| Check | Command | Result |
 | :-- | :-- | :-- |
 | build/vet | `go build ./...`, `go vet ./...`, `go vet -tags "integration e2e" ./...` | clean |
 | unit | `go test ./internal/... -count=1` | green |
-| integration | `go test -tags integration ./internal/...` | green (котировка, fill-once, период, кап истории, кламп лимита, bufconn) |
-| e2e compose | `make e2e` (schema.ps1, миграции 5, grpcurl rate/locked_until/txid/confirmations/фильтры) | green |
+| integration | `go test -tags integration ./internal/...` | green (quote, fill-once, period, history cap, limit clamp, bufconn) |
+| e2e compose | run instruction `test/e2e/E2E.md`, scenario E2E_Payment_Schema (migrations 5, grpcurl rate/locked_until/txid/confirmations/filters) | green |
 | e2e Kafka | `make test-e2e` (canonical consumer) | green |
-| покрытие | `-coverpkg` по internal | 91.7% (было 90.x) |
-| lint/эм-деш | golangci-lint в Docker; `check-no-emdash.ps1` | 0 issues; clean |
+| coverage | `-coverpkg` over internal | 91.7% (was 90.x) |
+| lint/em-dash | golangci-lint in Docker; `check-no-emdash.ps1` | 0 issues; clean |
 
-## 6. Нефункциональные требования
+## 6. Non-functional requirements
 
-Чтения только по существующим индексам 4.1: PK `payments` для Get и
-`payments_merchant_created_idx (merchant_id, created_at DESC, id DESC)` для
-листинга с периодом; новых индексов не требуется; дедлайн 1 с (CBL-000,
-раздел 3); gRPC-порт не публикуется вне доверенной сети (KI-payment-04);
-денежные значения без float.
+Reads use only the existing 4.1 indexes: the `payments` PK for Get and
+`payments_merchant_created_idx (merchant_id, created_at DESC, id DESC)` for listing
+with a period; no new indexes are required; deadline 1 s (CBL-000, section 3); the
+gRPC port is not published outside the trusted network (KI-payment-04); monetary
+values without float.
 
 ## 7. Edge cases
 
-Курсор из другой выборки принимается (фильтр `(created_at, id) <`); голого
-`payment_id` в курсоре не бывает - контракт описывает непрозрачный
-`next_cursor`; `created_to` равен `created_from` - `InvalidArgument` (пустой
-период); запись ровно на границе `to` не входит; платеж без котировки
-(создание не дошло до `created`) отдается без `rate`/`locked_until`;
-терминальные состояния неизменяемы (4.1); чужой/несуществующий `merchant_id` -
-пустой список (не 404); `limit` больше 200 клампится; история Get ограничена
-последними 500 переходами (неограниченный timeline нетерминального платежа -
-вектор роста ответа, KI-payment-07/02: полная история - 14.2); невалидные UUID
-нормализуются (`parsed.String()`) до запроса в БД.
+A cursor from another query is accepted (filter `(created_at, id) <`); a bare
+`payment_id` never appears in the cursor - the contract describes an opaque
+`next_cursor`; `created_to` equal to `created_from` - `InvalidArgument` (empty
+period); a record exactly on the `to` boundary is not included; a payment without
+a quote (creation did not reach `created`) is returned without
+`rate`/`locked_until`; terminal states are immutable (4.1); a foreign/nonexistent
+`merchant_id` - an empty list (not 404); `limit` greater than 200 is clamped; the
+Get history is limited to the last 500 transitions (an unbounded timeline of a
+non-terminal payment is a response growth vector, KI-payment-07/02: full history -
+14.2); invalid UUIDs are normalized (`parsed.String()`) before the DB query.
 
-## 8. Ревью (CBL-001, шаг 6)
+## 8. Review (CBL-001, step 6)
 
-Четыре независимых прохода (15.10.2026). BLOCKER закрыты аддитивным релизом
-`cbl-protos@cf-3.4`: `txid`/`confirmations` в `Payment` (REST-инвойс 7.4 без
-источника) и `expected_amount` в `CreatePaymentResponse` (полнота 201);
-заодно исправлено описание курсора на непрозрачный `next_cursor`. MAJOR
-закрыты: предел timeline в `Repository.Get` (последние 500 переходов - защита
-от неограниченного ответа при долгоживущем нетерминальном платеже); модель
-доверия чтений зафиксирована в T-PAY-08 и расширенном KI-payment-04 (gRPC
-без authN: `merchant_id` из тела, Get по UUID, reflection; порт не публиковать
-вне доверенной сети, 7.4 берет мерчанта из токена); граница transport ->
-usecase -> storage сохранена, слой не пропускает вызовы хранилища напрямую;
-нормализация UUID отсекает `urn:uuid`-формы до Postgres-каста. MINOR/NIT
-закрыты: `usecase.PaymentQuery` без мертвого log; `%w` в decodeCursor; Down
-миграции дословно повторяет тело 00001; контейнер e2e вынесен в переменную;
-тесты невалидного/равного периода, пустого списка чужого мерчанта, nil-путей
-маппинга, timeline-капа, клампа лимита, курсора чужой выборки; ассерты
-`txid`/`confirmations`/`received_amount`/comment в integration и e2e.
-Принято осознанно: `fee` не в контракте (KI-payment-06; REST-поля fee в
-инвойсе нет); timeline REST не дедуплицирует самопереходы - дедупликацию
-определяет 7.4; `CreatePayment`/`CancelPayment` остаются `Unimplemented`
-до 4.2 (скоуп 4.2 в CBL-004 расширен на CancelPayment).
+Four independent passes (15.10.2026). BLOCKER findings closed by the additive
+`cbl-protos@cf-3.4` release: `txid`/`confirmations` in `Payment` (REST invoice 7.4
+without a source) and `expected_amount` in `CreatePaymentResponse` (201
+completeness); the cursor description was also fixed to the opaque `next_cursor`.
+MAJOR findings closed: the timeline limit in `Repository.Get` (the last 500
+transitions - protection against an unbounded response for a long-lived
+non-terminal payment); the read trust model fixed in T-PAY-08 and the extended
+KI-payment-04 (gRPC without authN: `merchant_id` from the body, Get by UUID,
+reflection; do not publish the port outside the trusted network, 7.4 takes the
+merchant from the token); the transport -> usecase -> storage boundary preserved,
+the layer does not let storage calls through directly; UUID normalization cuts off
+`urn:uuid` forms before the Postgres cast. MINOR/NIT findings closed:
+`usecase.PaymentQuery` without a dead log; `%w` in decodeCursor; the migration
+Down verbatim repeats the 00001 body; the e2e container moved to a variable; tests
+for an invalid/equal period, an empty list of a foreign merchant, nil mapping
+paths, the timeline cap, the limit clamp, a cursor from another query; asserts of
+`txid`/`confirmations`/`received_amount`/comment in integration and e2e.
+Accepted deliberately: `fee` is not in the contract (KI-payment-06; there is no
+REST fee field in the invoice); the REST timeline does not deduplicate
+self-transitions - deduplication is determined by 7.4; `CreatePayment`/`CancelPayment`
+remain `Unimplemented` until 4.2 (the 4.2 scope in CBL-004 is extended with
+CancelPayment).
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | BLOCKER: txid обещан FR-1, но отсутствует в контракте; MINOR/NIT: курсор в контракте - payment_id vs base64; мягкая UUID-валидация; нет тестов edge cases (курсор чужой выборки, равные границы, кламп, nil-пути, comment/received), хрупкий sleep | cf-3.4 + маппинг; комментарий контракта исправлен; нормализация UUID; тесты добавлены; seed через автомат/ассерты |
-| Архитектуры | BLOCKER: нет txid/confirmations и expected_amount для 201; MAJOR: проекция invoice-полей не разобрана, граница слоев нарушена, документы не синхронизированы; MINOR: CancelPayment без владельца, формулировка fee, timeline-семантика, fail-closed состояния, AGENTS | cf-3.4; §9 спеки (проекция 7.4: Billing DB - amount/currency/meta, Payment - состояние/суммы/сеть); usecase.PaymentQuery без storage-типов в транспорте... фильтр уже usecase; CBL-003/000/004 + protos follow-up; CBL-004 4.2 + Cancel; формулировки; зафиксировано 7.4; stateFromProto fail-closed (пусто -> InvalidArgument для фильтра, UNSPECIFIED наружу не отдается); AGENTS |
-| С контекстом | BLOCKER: txid; MAJOR: курсор, полнота обновлений; MINOR: log, %w, Down-комментарий, контейнер e2e; NIT: зависимости, §5/§8 | cf-3.4; исправлено; docs+follow-up; убрано; %w; добавлено; вынесено; заполнено |
-| Безопасности | MAJOR: IDOR read-периметра + KI-ссылка неверна; timeline без предела; MINOR: курсор-оракул, rate без CHECK; NIT: reflection, публикация порта, UUID-нормализация, образ grpcurl | T-PAY-08 + KI-payment-04 расширены; кап 500; оракула нет (opaque); CHECK rate - 4.2 (валидирует курс); задокументировано в KI; нормализовано; тег образа как в 10.x |
+| No context | BLOCKER: txid is promised by FR-1 but is absent in the contract; MINOR/NIT: cursor in the contract - payment_id vs base64; soft UUID validation; no tests of edge cases (a cursor from another query, equal boundaries, the clamp, nil paths, comment/received), fragile sleep | cf-3.4 + mapping; the contract comment fixed; UUID normalization; tests added; seed via the state machine/asserts |
+| Architecture | BLOCKER: no txid/confirmations and expected_amount for 201; MAJOR: the invoice field projection is not broken down, the layer boundary is violated, documents are not synchronized; MINOR: CancelPayment without an owner, the fee wording, timeline semantics, fail-closed states, AGENTS | cf-3.4; §9 of the spec (7.4 projection: Billing DB - amount/currency/meta, Payment - state/amounts/network); usecase.PaymentQuery without storage types in the transport... the filter is already usecase; CBL-003/000/004 + protos follow-up; CBL-004 4.2 + Cancel; wording; fixed in 7.4; stateFromProto fail-closed (empty -> InvalidArgument for the filter, UNSPECIFIED is not exposed outward); AGENTS |
+| With context | BLOCKER: txid; MAJOR: cursor, completeness of updates; MINOR: log, %w, Down comment, e2e container; NIT: dependencies, §5/§8 | cf-3.4; fixed; docs+follow-up; removed; %w; added; extracted; filled |
+| Security | MAJOR: IDOR of the read perimeter + the KI reference is wrong; timeline without a limit; MINOR: cursor oracle, rate without CHECK; NIT: reflection, port publication, UUID normalization, grpcurl image | T-PAY-08 + KI-payment-04 extended; cap 500; no oracle (opaque); CHECK rate - 4.2 (validates the rate); documented in KI; normalized; image tag as in 10.x |
 
-## 9. Решения и открытые вопросы
+## 9. Decisions and open questions
 
-- `fee` платежа - KI-payment-06 (правила комиссии 7.x): отдельного REST-поля
-  fee в инвойсе нет; webhook-поле питается `payment.events` (CF-2).
-- `pay_amount`/`pay_asset` выводятся из `expected_amount`; ответ 201 получает
-  `expected_amount` в `CreatePaymentResponse` (cf-3.4) - отдельный вызов
-  GetPayment на горячем пути не нужен.
-- Проекция инвойса 7.4: `amount`/`currency`, `merchant_order_id`, `metadata`,
-  `checkout_url` и фильтр по `merchant_order_id` живут в БД Billing API;
-  Payment - источник состояния, сумм, котировки, сети и timeline; курсор
-  списка - по Payment (`created_at, id`), проекция джойнится по `payment_id`.
-- KI-payment-04 (нет authN на gRPC): ListPayments принимает `merchant_id` из
-  тела, GetPayment - по UUID; 7.4 обязан брать мерчанта из токена; до mTLS
-  (0.6) порт 9030 не публикуется вне доверенной сети; reflection - dev-удобство.
-- Timeline REST: самопереходы (обновление confirmations) попадают в историю;
-  дедупликация/фильтрация - решение 7.4; полная история - 14.2.
-- `rate` без CHECK в БД: валидация - обязанность писателя (4.2).
+- Payment `fee` - KI-payment-06 (fee rules 7.x): there is no separate REST fee
+  field in the invoice; the webhook field is fed by `payment.events` (CF-2).
+- `pay_amount`/`pay_asset` are derived from `expected_amount`; the 201 response
+  receives `expected_amount` in `CreatePaymentResponse` (cf-3.4) - a separate
+  GetPayment call on the hot path is not needed.
+- 7.4 invoice projection: `amount`/`currency`, `merchant_order_id`, `metadata`,
+  `checkout_url` and the filter by `merchant_order_id` live in the Billing API DB;
+  Payment is the source of state, amounts, quote, network and timeline; the list
+  cursor is by Payment (`created_at, id`), the projection is joined by `payment_id`.
+- KI-payment-04 (no authN on gRPC): ListPayments accepts `merchant_id` from the
+  body, GetPayment - by UUID; 7.4 must take the merchant from the token; until
+  mTLS (0.6) port 9030 is not published outside the trusted network; reflection is
+  a dev convenience.
+- REST timeline: self-transitions (confirmation updates) get into the history;
+  deduplication/filtering is a 7.4 decision; full history - 14.2.
+- `rate` without a CHECK in the DB: validation is the writer's duty (4.2).
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Реализация storage/usecase/transport, миграция 00005, тесты, AGENTS/runbook,
-коммит `CBL-4.8: gRPC-чтения Payment для счета мерчанта`; контрактный коммит уже
-выпущен (`cbl-protos` `CBL-4.8`, тег `cf-3.3`).
+Implementation of storage/usecase/transport, migration 00005, tests, AGENTS/runbook,
+commit `CBL-4.8: Payment gRPC reads for the merchant invoice`; the contract commit
+has already been released (`cbl-protos` `CBL-4.8`, tag `cf-3.3`).

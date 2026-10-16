@@ -1,3 +1,3 @@
-// Пакет storage содержит доступ к хранилищам сервиса payment:
-// GORM-репозитории, миграции и интеграцию с outbox/inbox.
+// Package storage contains access to the payment service storages:
+// GORM repositories, migrations and outbox/inbox integration.
 package storage

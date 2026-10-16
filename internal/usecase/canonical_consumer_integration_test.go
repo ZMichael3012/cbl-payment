@@ -54,7 +54,7 @@ func setupConsumerDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// pendingPayment создает платеж и доводит его до состояния pending.
+// pendingPayment creates a payment and drives it to the pending state.
 func pendingPayment(t *testing.T, repo *storage.Repository) storage.Payment {
 	t.Helper()
 	payment := storage.Payment{
@@ -100,16 +100,16 @@ func TestIntegrationCanonicalConsumerAppliesEvents(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.StateConfirming), payment.State)
 	assert.Equal(t, 4, payment.Confirmations)
-	assert.Len(t, history, 5, "создание, created, pending, detected, confirming")
+	assert.Len(t, history, 5, "creation, created, pending, detected, confirming")
 
-	// Устаревшее событие после терминального состояния - no-op без ошибки.
+	// A stale event after a terminal state is a no-op without an error.
 	completed, err := repo.Transition(ctx, canonicalPaymentID, uint64(payment.StateVersion), domain.StateCompleted, storage.TransitionPatch{})
 	require.NoError(t, err)
 	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, detectedEvent())))
 	payment, history, err = repo.Get(ctx, canonicalPaymentID)
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.StateCompleted), payment.State)
-	assert.Equal(t, completed.StateVersion, payment.StateVersion, "устаревшее событие не растит версию")
+	assert.Equal(t, completed.StateVersion, payment.StateVersion, "a stale event does not grow the version")
 	assert.Len(t, history, 6)
 }
 
@@ -131,7 +131,7 @@ func TestIntegrationCanonicalConsumerConfirmedFirstChain(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.StateConfirming), payment.State)
 	assert.Equal(t, 2, payment.Confirmations)
-	assert.Equal(t, "erc20", payment.Network, "network события фиксируется в патче")
+	assert.Equal(t, "erc20", payment.Network, "the event network is recorded in the patch")
 	assert.Len(t, history, 5, "creating, created, pending, detected, confirming")
 }
 
@@ -160,25 +160,25 @@ func TestIntegrationCanonicalConsumerDuplicateViaGuard(t *testing.T) {
 		return consumer.Handle(ctx, tx, msg)
 	})
 	require.NoError(t, err)
-	assert.False(t, processed, "повторный event_id не обрабатывается")
+	assert.False(t, processed, "a repeated event_id is not processed")
 
 	afterSecond, _, err := repo.Get(ctx, canonicalPaymentID)
 	require.NoError(t, err)
-	assert.Equal(t, afterFirst.StateVersion, afterSecond.StateVersion, "дубликат не растит версию")
+	assert.Equal(t, afterFirst.StateVersion, afterSecond.StateVersion, "a duplicate does not grow the version")
 }
 
-// failingStore ломает второй переход: проверяет атомарность с inbox.
+// failingStore breaks the second transition: it checks atomicity with the inbox.
 type failingStore struct {
 	repo  *storage.Repository
 	calls int
 }
 
-// PaymentTx делегирует в репозиторий.
+// PaymentTx delegates to the repository.
 func (f *failingStore) PaymentTx(ctx context.Context, tx *gorm.DB, id string) (storage.Payment, error) {
 	return f.repo.PaymentTx(ctx, tx, id)
 }
 
-// TransitionTx падает на втором вызове.
+// TransitionTx fails on the second call.
 func (f *failingStore) TransitionTx(ctx context.Context, tx *gorm.DB, id string, expectedVersion uint64, to domain.State, patch storage.TransitionPatch) (storage.Payment, error) {
 	f.calls++
 	if f.calls == 2 {
@@ -206,18 +206,18 @@ func TestIntegrationCanonicalConsumerTransactionalAtomicity(t *testing.T) {
 	processed, err := guard.Process(ctx, db, usecase.ConsumerGroupCanonical, eventID, func(tx *gorm.DB) error {
 		return consumer.Handle(ctx, tx, canonicalMessage(t, confirmed))
 	})
-	require.Error(t, err, "сбой второго перехода обязан провалить обработку")
+	require.Error(t, err, "a second transition failure must fail the processing")
 	assert.False(t, processed)
 
 	after, history, err := repo.Get(ctx, canonicalPaymentID)
 	require.NoError(t, err)
-	assert.Equal(t, before.State, after.State, "переходы откатились вместе с inbox")
+	assert.Equal(t, before.State, after.State, "the transitions rolled back together with the inbox")
 	assert.Equal(t, before.StateVersion, after.StateVersion)
-	assert.Len(t, history, int(before.StateVersion), "журнал без следов отката")
+	assert.Len(t, history, int(before.StateVersion), "the journal has no traces of the rollback")
 
 	var inboxRows int64
 	require.NoError(t, db.Table("inbox").Where("event_id = ?", eventID).Count(&inboxRows).Error)
-	assert.Zero(t, inboxRows, "inbox-строка откатилась вместе с переходами")
+	assert.Zero(t, inboxRows, "the inbox row rolled back together with the transitions")
 }
 
 func TestIntegrationCanonicalConsumerCompletesViaPolicy(t *testing.T) {
@@ -237,7 +237,7 @@ func TestIntegrationCanonicalConsumerCompletesViaPolicy(t *testing.T) {
 
 	payment, history, err := repo.Get(ctx, canonicalPaymentID)
 	require.NoError(t, err)
-	assert.Equal(t, string(domain.StateCompleted), payment.State, "политика завершает платеж по порогу")
+	assert.Equal(t, string(domain.StateCompleted), payment.State, "the policy completes the payment at the threshold")
 	require.NotNil(t, payment.CompletedAt)
 	assert.Len(t, history, 6, "creating, created, pending, detected, confirming, completed")
 }
@@ -259,7 +259,7 @@ func TestIntegrationCanonicalConsumerRepeatedBelowThreshold(t *testing.T) {
 	assert.Equal(t, string(domain.StateConfirming), payment.State)
 	assert.Equal(t, 2, payment.Confirmations)
 
-	// Повторный confirmed ниже порога остается confirming (self-переход).
+	// A repeated confirmed below the threshold stays confirming (self-transition).
 	second := detectedEvent()
 	second.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
 	second.Confirmations = 4

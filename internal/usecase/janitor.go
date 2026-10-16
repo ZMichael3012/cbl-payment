@@ -12,71 +12,72 @@ import (
 	"github.com/cbl/cbl-payment/internal/storage"
 )
 
-// Значения конфигурации janitor-а по умолчанию.
+// Default janitor configuration values.
 const (
-	// DefaultJanitorInterval задает период проходов без настройки.
+	// DefaultJanitorInterval defines the sweep period without configuration.
 	DefaultJanitorInterval = 30 * time.Second
-	// DefaultJanitorBatch задает размер пакета выборок без настройки.
+	// DefaultJanitorBatch defines the selection batch size without configuration.
 	DefaultJanitorBatch = 100
-	// DefaultCreatingTimeout задает порог зависшего создания без настройки.
+	// DefaultCreatingTimeout defines the stuck creation threshold without configuration.
 	DefaultCreatingTimeout = 5 * time.Minute
-	// DefaultStuckTimeout задает порог наблюдения за detected/confirming без настройки.
+	// DefaultStuckTimeout defines the detected/confirming observation threshold without configuration.
 	DefaultStuckTimeout = 6 * time.Hour
-	// maxJanitorBatch ограничивает пакет выборок janitor-а.
+	// maxJanitorBatch bounds the janitor selection batch.
 	maxJanitorBatch = 1000
-	// maxStuckDetails ограничивает число платежей, детализируемых в WARN за проход.
+	// maxStuckDetails bounds the number of payments detailed in WARN per sweep.
 	maxStuckDetails = 10
 )
 
-// ErrInvalidJanitorConfig сообщает о некорректной конфигурации janitor-а.
+// ErrInvalidJanitorConfig reports an invalid janitor configuration.
 var ErrInvalidJanitorConfig = errors.New("usecase: invalid janitor config")
 
-// JanitorStore описывает операции платежей, нужные janitor-у: выборки кандидатов
-// и оптимистичные переходы (CAS по state_version закрывает гонки с consumer 4.3,
-// задачами 4.2/4.4 и другими экземплярами janitor-а).
+// JanitorStore describes the payment operations the janitor needs: candidate
+// selections and optimistic transitions (CAS on state_version closes races with
+// the 4.3 consumer, tasks 4.2/4.4 and other janitor instances).
 type JanitorStore interface {
-	// FindExpired возвращает счета created/pending со сроком не позже before.
+	// FindExpired returns created/pending invoices with a deadline not later than before.
 	FindExpired(ctx context.Context, before time.Time, limit int) ([]storage.Payment, error)
-	// FindCreating возвращает платежи в creating, созданные не позже olderThan.
+	// FindCreating returns payments in creating created not later than olderThan.
 	FindCreating(ctx context.Context, olderThan time.Time, limit int) ([]storage.Payment, error)
-	// FindStuck возвращает detected/confirming без движения с updated_at не позже olderThan.
+	// FindStuck returns detected/confirming payments without movement with updated_at not later than olderThan.
 	FindStuck(ctx context.Context, olderThan time.Time, limit int) ([]storage.Payment, error)
-	// Transition выполняет оптимистичный переход состояния.
+	// Transition performs an optimistic state transition.
 	Transition(ctx context.Context, id string, expectedVersion uint64, to domain.State, patch storage.TransitionPatch) (storage.Payment, error)
 }
 
-// JanitorConfig задает параметры фоновых задач; нулевые значения заменяются
-// значениями по умолчанию, отрицательные (и Batch больше потолка) отклоняются.
+// JanitorConfig defines the background task parameters; zero values are replaced
+// by defaults, negative ones (and Batch above the ceiling) are rejected.
 type JanitorConfig struct {
-	// Interval задает период проходов.
+	// Interval defines the sweep period.
 	Interval time.Duration
-	// Batch задает размер пакета выборок (1 - 1000).
+	// Batch defines the selection batch size (1 to 1000).
 	Batch int
-	// CreatingAfter задает порог зависшего создания.
+	// CreatingAfter defines the stuck creation threshold.
 	CreatingAfter time.Duration
-	// StuckAfter задает порог наблюдения за detected/confirming.
+	// StuckAfter defines the detected/confirming observation threshold.
 	StuckAfter time.Duration
-	// Clock задает источник времени (nil - time.Now); тестовый шов.
+	// Clock defines the time source (nil means time.Now); a test seam.
 	Clock func() time.Time
 }
 
-// JanitorResult собирает счетчики одного прохода.
+// JanitorResult collects the counters of one sweep.
 type JanitorResult struct {
-	// Expired задает число истекших счетов.
+	// Expired defines the number of expired invoices.
 	Expired int
-	// CreatingFailed задает число закрытых зависших созданий.
+	// CreatingFailed defines the number of closed stuck creations.
 	CreatingFailed int
-	// Stuck задает число замеченных зависших платежей.
+	// Stuck defines the number of observed stuck payments.
 	Stuck int
-	// Conflicts задает число переходов, проигравших CAS-гонку.
+	// Conflicts defines the number of transitions that lost the CAS race.
 	Conflicts int
-	// Errors задает число ошибок выборок и переходов.
+	// Errors defines the number of selection and transition errors.
 	Errors int
 }
 
-// Janitor выполняет фоновые задачи платежа: истекает счета created/pending по
-// предикату политики (4.5), закрывает зависшие создания состоянием failed и
-// делает зависшие detected/confirming видимыми в логах, не трогая деньги.
+// Janitor performs the payment background tasks: it expires created/pending
+// invoices by the policy predicate (4.5), closes stuck creations with the failed
+// state and makes stuck detected/confirming payments visible in logs without
+// touching money.
 type Janitor struct {
 	store         JanitorStore
 	log           *zap.Logger
@@ -87,8 +88,8 @@ type Janitor struct {
 	clock         func() time.Time
 }
 
-// NewJanitor создает Janitor; пустые значения конфигурации заменяются
-// значениями по умолчанию, некорректные возвращают ErrInvalidJanitorConfig.
+// NewJanitor creates a Janitor; empty configuration values are replaced by
+// defaults, invalid ones return ErrInvalidJanitorConfig.
 func NewJanitor(store JanitorStore, log *zap.Logger, cfg JanitorConfig) (*Janitor, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: store is nil", ErrInvalidJanitorConfig)
@@ -129,8 +130,8 @@ func NewJanitor(store JanitorStore, log *zap.Logger, cfg JanitorConfig) (*Janito
 	return janitor, nil
 }
 
-// Run выполняет немедленный проход, затем повторяет их по тикеру до отмены
-// контекста (SIGTERM): истечение не откладывается на первый интервал.
+// Run performs an immediate sweep, then repeats sweeps on a ticker until the
+// context is cancelled (SIGTERM): expiry is not deferred to the first interval.
 func (j *Janitor) Run(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
@@ -148,10 +149,10 @@ func (j *Janitor) Run(ctx context.Context) {
 	}
 }
 
-// Sweep выполняет один проход: истечение счетов, закрытие зависших созданий,
-// наблюдение за зависшими платежами. Ошибки отдельных платежей и выборок не
-// прерывают проход и попадают в счетчики результата; отмена контекста
-// завершает проход без ошибок.
+// Sweep performs one sweep: invoice expiry, closing of stuck creations and
+// observation of stuck payments. Errors of individual payments and selections
+// do not interrupt the sweep and go into the result counters; context
+// cancellation finishes the sweep without errors.
 func (j *Janitor) Sweep(ctx context.Context) JanitorResult {
 	var result JanitorResult
 	if ctx.Err() != nil {
@@ -171,8 +172,8 @@ func (j *Janitor) Sweep(ctx context.Context) JanitorResult {
 	return result
 }
 
-// expireDue истекает счета created/pending: выборка кандидатов, повторная
-// проверка предиката политики на снимке и CAS-переход в expired.
+// expireDue expires created/pending invoices: candidate selection, re-check of
+// the policy predicate on the snapshot and a CAS transition to expired.
 func (j *Janitor) expireDue(ctx context.Context, now time.Time, result *JanitorResult) {
 	payments, err := j.store.FindExpired(ctx, now, j.batch)
 	if err != nil {
@@ -193,9 +194,9 @@ func (j *Janitor) expireDue(ctx context.Context, now time.Time, result *JanitorR
 				zap.Error(parseErr))
 			continue
 		}
-		// Повторная проверка предиката на снимке: сама выборка уже гарантирует
-		// состояние и срок, но переход выполняется по данным, прочитанным
-		// вызывающим кодом, и не должен доверять только SQL-условию.
+		// Re-check of the predicate on the snapshot: the selection itself already
+		// guarantees state and deadline, but the transition runs on data read by
+		// the caller and must not trust the SQL condition alone.
 		if !domain.ShouldExpire(state, payment.ExpiresAt, now) {
 			continue
 		}
@@ -203,8 +204,8 @@ func (j *Janitor) expireDue(ctx context.Context, now time.Time, result *JanitorR
 	}
 }
 
-// failStuckCreating закрывает создания, зависшие дольше порога: failed делает
-// too-early события для платежа детерминированно устаревшими (KI-payment-05).
+// failStuckCreating closes creations stuck longer than the threshold: failed
+// makes too-early events for the payment deterministically stale (KI-payment-05).
 func (j *Janitor) failStuckCreating(ctx context.Context, now time.Time, result *JanitorResult) {
 	cutoff := now.Add(-j.creatingAfter)
 	payments, err := j.store.FindCreating(ctx, cutoff, j.batch)
@@ -224,8 +225,8 @@ func (j *Janitor) failStuckCreating(ctx context.Context, now time.Time, result *
 	}
 }
 
-// reportStuck делает зависшие detected/confirming видимыми: состояние и деньги
-// не трогаются, ремедиация - 4.4 (после KI-01) и сверка 9.x.
+// reportStuck makes stuck detected/confirming payments visible: state and money
+// are not touched, remediation is 4.4 (after KI-01) and reconciliation 9.x.
 func (j *Janitor) reportStuck(ctx context.Context, now time.Time, result *JanitorResult) {
 	cutoff := now.Add(-j.stuckAfter)
 	payments, err := j.store.FindStuck(ctx, cutoff, j.batch)
@@ -254,9 +255,9 @@ func (j *Janitor) reportStuck(ctx context.Context, now time.Time, result *Janito
 	}
 }
 
-// transition выполняет CAS-переход janitor-а с учетом конфликта версии и ошибок.
+// transition performs the janitor CAS transition, handling version conflict and errors.
 func (j *Janitor) transition(ctx context.Context, payment storage.Payment, to domain.State, reason string, result *JanitorResult, applied *int) {
-	version := uint64(payment.StateVersion) //nolint:gosec // state_version ограничен CHECK (>= 1)
+	version := uint64(payment.StateVersion) //nolint:gosec // state_version is bounded by CHECK (>= 1)
 	updated, err := j.store.Transition(ctx, payment.ID, version, to, storage.TransitionPatch{Reason: reason})
 	if errors.Is(err, domain.ErrStateConflict) {
 		result.Conflicts++
@@ -282,7 +283,7 @@ func (j *Janitor) transition(ctx context.Context, payment storage.Payment, to do
 		zap.String("reason", reason))
 }
 
-// logResult пишет сводку прохода: Info при эффектах, Debug при пустом проходе.
+// logResult writes the sweep summary: Info on effects, Debug on an empty sweep.
 func (j *Janitor) logResult(result JanitorResult) {
 	if result == (JanitorResult{}) {
 		j.log.Debug("janitor: sweep finished, nothing to do")

@@ -17,7 +17,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// newJanitorIntegrationPayment создает платеж и возвращает хранилище.
+// newJanitorIntegrationPayment creates a payment and returns the storage record.
 func newJanitorIntegrationPayment(t *testing.T, repo *storage.Repository, key string) storage.Payment {
 	t.Helper()
 	id, err := uuid.NewV7()
@@ -36,7 +36,7 @@ func newJanitorIntegrationPayment(t *testing.T, repo *storage.Repository, key st
 	return payment
 }
 
-// janitorAt собирает janitor с часами, сдвинутыми относительно реального времени.
+// janitorAt assembles a janitor with a clock shifted relative to real time.
 func janitorAt(t *testing.T, repo *storage.Repository, now time.Time) *usecase.Janitor {
 	t.Helper()
 	janitor, err := usecase.NewJanitor(repo, zap.NewNop(), usecase.JanitorConfig{
@@ -68,7 +68,7 @@ func TestIntegrationJanitorExpiresPayment(t *testing.T) {
 	assert.Equal(t, "janitor expired", last.Reason)
 	assert.Equal(t, string(domain.StateCreated), last.FromState)
 
-	// Повторный проход - no-op: выборка по состоянию не вернет истекший платеж.
+	// A repeated sweep is a no-op: the selection by state does not return the expired payment.
 	assert.Zero(t, janitorAt(t, repo, time.Now().UTC()).Sweep(ctx).Expired)
 }
 
@@ -88,7 +88,7 @@ func TestIntegrationJanitorSkipsDetectedWithPastExpiry(t *testing.T) {
 
 	janitor := janitorAt(t, repo, time.Now().UTC())
 	result := janitor.Sweep(ctx)
-	assert.Zero(t, result.Expired, "обнаруженная оплата не истекает (KI-payment-08)")
+	assert.Zero(t, result.Expired, "a detected payment does not expire (KI-payment-08)")
 
 	updated, _, err := repo.Get(ctx, payment.ID)
 	require.NoError(t, err)
@@ -101,8 +101,8 @@ func TestIntegrationJanitorFailsStuckCreating(t *testing.T) {
 	repo := storage.NewRepository(db)
 	ctx := context.Background()
 
-	// Зависшее создание: backdate created_at разрешен на INSERT (immutable-поля
-	// защищает триггер только для UPDATE).
+	// Stuck creation: backdating created_at is allowed on INSERT (the trigger
+	// protects immutable fields only for UPDATE).
 	stuckID, err := uuid.NewV7()
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(`INSERT INTO payments
@@ -126,7 +126,7 @@ func TestIntegrationJanitorFailsStuckCreating(t *testing.T) {
 
 	stillFresh, _, err := repo.Get(ctx, fresh.ID)
 	require.NoError(t, err)
-	assert.Equal(t, string(domain.StateCreating), stillFresh.State, "свежее создание не закрывается")
+	assert.Equal(t, string(domain.StateCreating), stillFresh.State, "a fresh creation is not closed")
 }
 
 func TestIntegrationJanitorStuckScanRespectsThreshold(t *testing.T) {
@@ -153,17 +153,17 @@ func TestIntegrationJanitorStuckScanRespectsThreshold(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Zero(t, janitorAt(t, repo, time.Now().UTC()).Sweep(ctx).Stuck,
-		"свежие detected/confirming не считаются зависшими")
+		"fresh detected/confirming payments are not considered stuck")
 
 	future := time.Now().UTC().Add(7 * time.Hour)
 	result := janitorAt(t, repo, future).Sweep(ctx)
-	assert.Equal(t, 2, result.Stuck, "обновления старше порога 6h считаются зависшими")
+	assert.Equal(t, 2, result.Stuck, "updates older than the 6h threshold are considered stuck")
 
 	for _, id := range []string{detected.ID, confirming.ID} {
 		updated, _, err := repo.Get(ctx, id)
 		require.NoError(t, err)
 		assert.Equal(t, id, updated.ID)
-		assert.NotEqual(t, string(domain.StateFailed), updated.State, "наблюдение не меняет состояние")
+		assert.NotEqual(t, string(domain.StateFailed), updated.State, "observation does not change the state")
 	}
 }
 
@@ -177,8 +177,8 @@ func TestIntegrationJanitorDoubleSweepSingleEffect(t *testing.T) {
 	payment, err := repo.Transition(ctx, payment.ID, 1, domain.StateCreated, storage.TransitionPatch{ExpiresAt: &past})
 	require.NoError(t, err)
 
-	// Два прохода параллельно: CAS гарантирует один эффект независимо от
-	// того, увидели ли оба экземпляра один снимок.
+	// Two sweeps in parallel: CAS guarantees a single effect regardless of
+	// whether both instances saw the same snapshot.
 	janitors := make([]*usecase.Janitor, 0, 2)
 	for range 2 {
 		janitors = append(janitors, janitorAt(t, repo, time.Now().UTC()))

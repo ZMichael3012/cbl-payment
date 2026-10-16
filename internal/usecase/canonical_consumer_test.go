@@ -26,7 +26,7 @@ import (
 
 const canonicalPaymentID = "01a13d53-6bf5-707f-a944-c0d73586547e"
 
-// fakeCanonicalStore реализует usecase.CanonicalStore поверх памяти.
+// fakeCanonicalStore implements usecase.CanonicalStore over memory.
 type fakeCanonicalStore struct {
 	payment     storage.Payment
 	notFound    bool
@@ -35,7 +35,7 @@ type fakeCanonicalStore struct {
 	patches     []storage.TransitionPatch
 }
 
-// PaymentTx возвращает состояние фейкового платежа.
+// PaymentTx returns the state of the fake payment.
 func (f *fakeCanonicalStore) PaymentTx(_ context.Context, _ *gorm.DB, _ string) (storage.Payment, error) {
 	if f.notFound {
 		return storage.Payment{}, fmt.Errorf("%w: test", storage.ErrNotFound)
@@ -43,7 +43,7 @@ func (f *fakeCanonicalStore) PaymentTx(_ context.Context, _ *gorm.DB, _ string) 
 	return f.payment, nil
 }
 
-// newFakeStore создает платеж в заданном состоянии.
+// newFakeStore creates a payment in the given state.
 func newFakeStore(state domain.State, version int64) *fakeCanonicalStore {
 	return &fakeCanonicalStore{payment: storage.Payment{
 		ID:               canonicalPaymentID,
@@ -55,13 +55,13 @@ func newFakeStore(state domain.State, version int64) *fakeCanonicalStore {
 	}}
 }
 
-// TransitionTx выполняет CAS-переход над фейковым платежом.
+// TransitionTx performs a CAS transition over the fake payment.
 func (f *fakeCanonicalStore) TransitionTx(_ context.Context, _ *gorm.DB, _ string, expectedVersion uint64, to domain.State, patch storage.TransitionPatch) (storage.Payment, error) {
 	if f.conflicts > 0 {
 		f.conflicts--
 		return storage.Payment{}, fmt.Errorf("%w: test race", domain.ErrStateConflict)
 	}
-	if uint64(f.payment.StateVersion) != expectedVersion { //nolint:gosec // тестовое значение
+	if uint64(f.payment.StateVersion) != expectedVersion { //nolint:gosec // a test value
 		return storage.Payment{}, fmt.Errorf("%w: test version", domain.ErrStateConflict)
 	}
 	from, err := domain.ParseState(f.payment.State)
@@ -73,7 +73,7 @@ func (f *fakeCanonicalStore) TransitionTx(_ context.Context, _ *gorm.DB, _ strin
 		return storage.Payment{}, err
 	}
 	f.payment.State = string(to)
-	f.payment.StateVersion = int64(next) //nolint:gosec // тестовое значение
+	f.payment.StateVersion = int64(next) //nolint:gosec // a test value
 	if patch.ReceivedAmount != nil {
 		f.payment.ReceivedAmount = patch.ReceivedAmount
 	}
@@ -97,7 +97,7 @@ func (f *fakeCanonicalStore) TransitionTx(_ context.Context, _ *gorm.DB, _ strin
 	return f.payment, nil
 }
 
-// canonicalMessage собирает inbox-сообщение с сериализованным событием.
+// canonicalMessage assembles an inbox message with the serialized event.
 func canonicalMessage(t *testing.T, event *eventsv1.CanonicalPaymentEvent) inbox.Message {
 	t.Helper()
 	body, err := proto.Marshal(event)
@@ -105,7 +105,7 @@ func canonicalMessage(t *testing.T, event *eventsv1.CanonicalPaymentEvent) inbox
 	return inbox.Message{Value: body}
 }
 
-// detectedEvent собирает каноническое событие обнаружения.
+// detectedEvent assembles a canonical detection event.
 func detectedEvent() *eventsv1.CanonicalPaymentEvent {
 	return &eventsv1.CanonicalPaymentEvent{
 		PaymentId:      canonicalPaymentID,
@@ -150,7 +150,7 @@ func TestCanonicalConsumerConfirmedFirstChain(t *testing.T) {
 	assert.Equal(t, []domain.State{domain.StateDetected, domain.StateConfirming}, store.transitions)
 	assert.Equal(t, 3, store.payment.Confirmations)
 	require.Len(t, store.patches, 2)
-	assert.Nil(t, store.patches[0].ReceivedAmount, "данные события фиксируются на целевом состоянии")
+	assert.Nil(t, store.patches[0].ReceivedAmount, "event data is recorded on the target state")
 	require.NotNil(t, store.patches[1].ReceivedAmount)
 }
 
@@ -162,7 +162,7 @@ func TestCanonicalConsumerStaleAfterTerminal(t *testing.T) {
 
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, detectedEvent())))
 	assert.Equal(t, string(domain.StateCompleted), store.payment.State)
-	assert.Equal(t, int64(6), store.payment.StateVersion, "устаревшее событие не меняет состояние")
+	assert.Equal(t, int64(6), store.payment.StateVersion, "a stale event does not change the state")
 	assert.Empty(t, store.transitions)
 }
 
@@ -241,7 +241,7 @@ func TestCanonicalConsumerNormalizesAssetCase(t *testing.T) {
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 
 	require.NotNil(t, store.payment.ReceivedAsset)
-	assert.Equal(t, "USDT", *store.payment.ReceivedAsset, "актив нормализуется в верхний регистр")
+	assert.Equal(t, "USDT", *store.payment.ReceivedAsset, "the asset is normalized to upper case")
 }
 
 func TestCanonicalConsumerRejectsExpectedMismatch(t *testing.T) {
@@ -280,7 +280,7 @@ func TestCanonicalConsumerRequiresReceivedForMoneyEvents(t *testing.T) {
 	failedEvent.ReceivedAmount = nil
 	failedEvent.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_FAILED
 	require.NoError(t, failedConsumer.Handle(context.Background(), nil, canonicalMessage(t, failedEvent)),
-		"failed без суммы допустим")
+		"failed without an amount is allowed")
 }
 
 func TestCanonicalConsumerRejectsHugeConfirmations(t *testing.T) {
@@ -404,10 +404,10 @@ func TestCanonicalConsumerLateDetectedAfterExpiryAlerts(t *testing.T) {
 
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, detectedEvent())))
 	assert.Equal(t, string(domain.StateExpired), store.payment.State)
-	assert.Equal(t, int64(5), store.payment.StateVersion, "позднее событие не меняет состояние")
+	assert.Equal(t, int64(5), store.payment.StateVersion, "a late event does not change the state")
 	assert.Empty(t, store.transitions)
 
-	require.Len(t, logs.All(), 1, "поздняя оплата после истечения - отдельный алерт (KI-payment-08)")
+	require.Len(t, logs.All(), 1, "a late payment after expiry triggers a separate alert (KI-payment-08)")
 	assert.Equal(t, "late canonical event after expiry needs manual review", logs.All()[0].Message)
 }
 
@@ -422,13 +422,13 @@ func TestCanonicalConsumerPolicyWaitsBelowThreshold(t *testing.T) {
 	event.Confirmations = 5
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 
-	assert.Equal(t, string(domain.StateConfirming), store.payment.State, "порог по умолчанию 6")
+	assert.Equal(t, string(domain.StateConfirming), store.payment.State, "the default threshold is 6")
 	assert.Equal(t, 5, store.payment.Confirmations)
 
-	// Повторный confirmed ниже порога - self-переход с ростом confirmations.
+	// A repeated confirmed below the threshold is a self-transition with growing confirmations.
 	event.Confirmations = 6
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
-	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "достижение порога завершает")
+	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "reaching the threshold completes")
 }
 
 func TestCanonicalConsumerSelfTransitionConfirming(t *testing.T) {
@@ -443,7 +443,7 @@ func TestCanonicalConsumerSelfTransitionConfirming(t *testing.T) {
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 
 	assert.Equal(t, string(domain.StateConfirming), store.payment.State)
-	assert.Equal(t, int64(6), store.payment.StateVersion, "self-переход растит версию")
+	assert.Equal(t, int64(6), store.payment.StateVersion, "a self-transition grows the version")
 	assert.Equal(t, 3, store.payment.Confirmations)
 	assert.Equal(t, []domain.State{domain.StateConfirming}, store.transitions)
 }
@@ -451,7 +451,7 @@ func TestCanonicalConsumerSelfTransitionConfirming(t *testing.T) {
 func TestCanonicalConsumerPolicyClassifiesByAmount(t *testing.T) {
 	t.Parallel()
 
-	// canonical confirmed с суммой ниже толеранса: политика переводит в underpaid.
+	// canonical confirmed with an amount below tolerance: the policy moves to underpaid.
 	store := newFakeStore(domain.StatePending, 2)
 	consumer := usecase.NewCanonicalConsumer(store, nil)
 	event := detectedEvent()
@@ -461,7 +461,7 @@ func TestCanonicalConsumerPolicyClassifiesByAmount(t *testing.T) {
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 	assert.Equal(t, string(domain.StateUnderpaid), store.payment.State)
 
-	// Переплата в толерансе 2% - политика завершает completed.
+	// Overpayment within the 2% tolerance - the policy completes to completed.
 	policy, err := domain.ParseAmountPolicy("", 0, 200)
 	require.NoError(t, err)
 	overpaidStore := newFakeStore(domain.StateConfirming, 5)
@@ -471,7 +471,7 @@ func TestCanonicalConsumerPolicyClassifiesByAmount(t *testing.T) {
 	overpaid.ReceivedAmount = &commonv1.Money{MinorUnits: 102_000, Asset: "USDT", Decimals: 2}
 	overpaid.Confirmations = 6
 	require.NoError(t, overpaidConsumer.Handle(context.Background(), nil, canonicalMessage(t, overpaid)))
-	assert.Equal(t, string(domain.StateCompleted), overpaidStore.payment.State, "переплата в толерансе завершается")
+	assert.Equal(t, string(domain.StateCompleted), overpaidStore.payment.State, "overpayment within tolerance is completed")
 }
 
 func TestCanonicalConsumerCompletedAtUsesClock(t *testing.T) {
@@ -491,7 +491,7 @@ func TestCanonicalConsumerCompletedAtUsesClock(t *testing.T) {
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
 
 	require.NotNil(t, store.payment.CompletedAt)
-	assert.Equal(t, fixed, *store.payment.CompletedAt, "completed_at берется из часов consumer-а")
+	assert.Equal(t, fixed, *store.payment.CompletedAt, "completed_at comes from the consumer clock")
 }
 
 func TestCanonicalConsumerPolicyToleranceWins(t *testing.T) {
@@ -500,7 +500,7 @@ func TestCanonicalConsumerPolicyToleranceWins(t *testing.T) {
 	policy, err := domain.ParseAmountPolicy("", 100, 0)
 	require.NoError(t, err)
 
-	// Недоплата в пределах 1% при достигнутом пороге - политика завершает.
+	// Underpayment within 1% at a reached threshold - the policy completes.
 	store := newFakeStore(domain.StateDetected, 4)
 	consumer := usecase.NewCanonicalConsumer(store, nil, usecase.WithAmountPolicy(policy))
 	event := detectedEvent()
@@ -508,9 +508,9 @@ func TestCanonicalConsumerPolicyToleranceWins(t *testing.T) {
 	event.ReceivedAmount = &commonv1.Money{MinorUnits: 99_500, Asset: "USDT", Decimals: 2}
 	event.Confirmations = 6
 	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, event)))
-	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "canonical underpaid в толерансе завершается политикой")
+	assert.Equal(t, string(domain.StateCompleted), store.payment.State, "canonical underpaid within tolerance is completed by the policy")
 
-	// Недоплата в толерансе без порога подтверждений - ожидание.
+	// Underpayment within tolerance without the confirmation threshold - waiting.
 	waiting := newFakeStore(domain.StateDetected, 4)
 	waitingConsumer := usecase.NewCanonicalConsumer(waiting, nil, usecase.WithAmountPolicy(policy))
 	waitEvent := detectedEvent()

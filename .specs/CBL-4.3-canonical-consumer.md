@@ -1,170 +1,172 @@
-# CBL-4.3. Consumer канонических событий: дубли и порядок
+# CBL-4.3. Canonical event consumer: duplicates and ordering
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E4, Payment Service |
-| Репозиторий | `cbl-payment` |
-| Размер | M |
-| Волна и параллельная группа | W2-PAYMENT |
-| Зависит от | 4.1, 3.5 |
-| Версия контрактов | `cbl-protos@cf-2` (`billing/events/v1`, `CanonicalPaymentEvent`) |
-| Статус | done, ревью закрыто |
+| Epic | E4, Payment Service |
+| Repository | `cbl-payment` |
+| Size | M |
+| Wave and parallel group | W2-PAYMENT |
+| Depends on | 4.1, 3.5 |
+| Contract version | `cbl-protos@cf-2` (`billing/events/v1`, `CanonicalPaymentEvent`) |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Connector (3.5) публикует канонические события шлюза в `gateway.events.canonical`.
-Payment обязан перевести автомат (4.1) в состояние, соответствующее событию:
-`detected`, `confirmed`, `failed`, `expired`, `underpaid`, `overpaid`. Kafka дает
-at-least-once и порядок только внутри партиции: дубли и приход событий не по порядку
-(подтверждение раньше обнаружения, повтор после терминального состояния) обязаны быть
-безопасными.
+Connector (3.5) publishes canonical gateway events to `gateway.events.canonical`.
+Payment must move the state machine (4.1) to the state corresponding to the event:
+`detected`, `confirmed`, `failed`, `expired`, `underpaid`, `overpaid`. Kafka provides
+at-least-once delivery and ordering only within a partition: duplicates and out-of-order
+event arrival (a confirmation before detection, a repeat after a terminal state) must be
+safe.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: consumer-группа `cbl-payment-canonical`, маппинг канонических событий в
-цепочки переходов, применение с CAS и повторами, защита от дублей и устаревших
-событий, обвязка main.
-Out of scope: пороги подтверждений и `completed` по сумме (4.5), перепроверка статуса
-через `GetGatewayPayment` (4.4), публикация `payment.events` (4.7), нормализация
-вебхуков (3.5).
+In scope: the `cbl-payment-canonical` consumer group, mapping of canonical events to
+transition chains, application with CAS and retries, protection against duplicates and
+stale events, main wiring.
+Out of scope: confirmation thresholds and `completed` by amount (4.5), status re-check
+via `GetGatewayPayment` (4.4), `payment.events` publication (4.7), webhook normalization
+(3.5).
 
-## 3. Функциональные требования
+## 3. Functional requirements
 
-FR-1. Подписка на `gateway.events.canonical` (группа `cbl-payment-canonical`) через
-kit `inbox.Processor` + `kafkaconsumer`: retry-топики 5s/1m/10m и DLQ, забрасывание
-через продюсера kit (как в 2.7). Обработка идемпотентна; бизнес-эффект - только
-переходы автомата.
+FR-1. Subscription to `gateway.events.canonical` (group `cbl-payment-canonical`) via the
+kit `inbox.Processor` + `kafkaconsumer`: retry topics 5s/1m/10m and DLQ, parking via the
+kit producer (as in 2.7). Processing is idempotent; the business effect is state machine
+transitions only.
 
-FR-2. План события (домен): функция `PlanEvent(current, event)` возвращает цепочку
-переходов, признак «устаревшее» (пустая цепочка, подтверждение без эффекта) или
-`ErrEventTooEarly` (событие опередило создание счета - повтор через retry-топики):
+FR-2. Event plan (domain): the function `PlanEvent(current, event)` returns a chain of
+transitions, a stale flag (an empty chain, a confirmation without an effect), or
+`ErrEventTooEarly` (the event overtook invoice creation - a retry via the retry topics):
 
-| Текущее | detected | confirmed | failed | expired | underpaid/overpaid |
+| Current | detected | confirmed | failed | expired | underpaid/overpaid |
 | :-- | :-- | :-- | :-- | :-- | :-- |
 | creating/created | too early | too early | too early | too early | too early |
 | pending | detected | detected, confirming | failed | expired | detected, terminal |
 | detected | detected (self) | confirming | failed | stale | terminal |
 | confirming | stale | confirming (self) | failed | stale | terminal |
-| терминальные | stale | stale | stale | stale | stale |
+| terminal | stale | stale | stale | stale | stale |
 
-Терминальные: `completed`, `expired`, `underpaid`, `overpaid`, `failed`, `cancelled`.
+Terminal: `completed`, `expired`, `underpaid`, `overpaid`, `failed`, `cancelled`.
 
-FR-3. Применение: `PaymentTx` (снимок) -> `PlanEvent` -> последовательные
-`TransitionTx` с CAS; полевой патч события (полученная сумма, `txid`, `gateway_id`,
-`provider`, `network`, `confirmations`) применяется на целевом (последнем) шаге
-цепочки; `confirmations` пишутся только для `detected`/`confirmed`. Переходы и
-inbox-запись коммитятся в одной транзакции Guard (`CBL-003`, раздел 6): сбой
-обработки откатывает эффект вместе со строкой inbox. `ErrStateConflict` (гонка с
-4.2/4.4/фоновыми задачами) - повтор: перечитать, заново построить план (до 3
-попыток), затем вернуть ошибку в retry-топики.
+FR-3. Application: `PaymentTx` (snapshot) -> `PlanEvent` -> sequential `TransitionTx`
+with CAS; the event field patch (the received amount, `txid`, `gateway_id`, `provider`,
+`network`, `confirmations`) is applied at the target (last) step of the chain;
+`confirmations` are written only for `detected`/`confirmed`. Transitions and the inbox
+record are committed in one Guard transaction (`CBL-003`, section 6): a processing
+failure rolls back the effect together with the inbox row. `ErrStateConflict` (a race
+with 4.2/4.4/background tasks) - a retry: reread, rebuild the plan (up to 3 attempts),
+then return the error to the retry topics.
 
-FR-4. Дубли: `event_id` из конверта защищен inbox-таблицей (kit Processor);
-повторная доставка того же события не создает второго эффекта. Устаревшее событие
-(FR-2) подтверждается (ack) с WARN-логом: версия и журнал не меняются.
+FR-4. Duplicates: `event_id` from the envelope is protected by the inbox table (kit
+Processor); a repeated delivery of the same event creates no second effect. A stale
+event (FR-2) is acknowledged (ack) with a WARN log: the version and journal do not
+change.
 
-FR-5. Ошибки входа: невалидное событие (битый protobuf, невалидный `payment_id`,
-отрицательная сумма, шкала вне 0 - 18, пустой или слишком длинный идентификатор,
-`confirmations` больше 1 000 000, отсутствие полученной суммы для
-`detected`/`confirmed`/`underpaid`/`overpaid`, несовпадение актива или шкалы с
-ожидаемыми реквизитами платежа) - `errInvalidCanonicalEvent` -> retry-топики и DLQ;
-актив нормализуется в верхний регистр; `UNSPECIFIED`/неизвестный enum - WARN и ack
-без эффекта; платеж не найден - ошибка (повтор): событие не может появиться раньше
-транзакции создания (гонка с 4.2 закрывается ретраями). Недоверенные идентификаторы
-в ошибках усекаются (не раздувают DLQ-конверт).
+FR-5. Input errors: an invalid event (broken protobuf, an invalid `payment_id`, a
+negative amount, a scale outside 0 - 18, an empty or too long identifier,
+`confirmations` above 1 000 000, a missing received amount for
+`detected`/`confirmed`/`underpaid`/`overpaid`, an asset or scale mismatch with the
+expected payment details) - `errInvalidCanonicalEvent` -> retry topics and DLQ; the
+asset is normalized to uppercase; `UNSPECIFIED`/an unknown enum - WARN and ack with no
+effect; the payment is not found - an error (a retry): the event cannot appear before
+the creation transaction (the race with 4.2 is closed by retries). Untrusted identifiers
+in errors are truncated (they do not inflate the DLQ envelope).
 
-FR-6. main: при заданном `KAFKA_BROKERS` поднимается consumer (группа из
-`KAFKA_CONSUMER_GROUP` или `cbl-payment-canonical`); без брокеров - предупреждение,
-HTTP/gRPC работают.
+FR-6. main: with `KAFKA_BROKERS` set, the consumer starts (the group from
+`KAFKA_CONSUMER_GROUP` or `cbl-payment-canonical`); without brokers - a warning, HTTP/
+gRPC still work.
 
-## 4. Контракты
+## 4. Contracts
 
-Вход - `billing.events.v1.CanonicalPaymentEvent` (CF-2): `payment_id`, `gateway_id`,
+The input is `billing.events.v1.CanonicalPaymentEvent` (CF-2): `payment_id`, `gateway_id`,
 `provider`, `type`, `received_amount`, `confirmations`, `txid`, `network`,
-`gateway_event_ts`. Исходящих контрактов нет.
+`gateway_event_ts`. There are no outbound contracts.
 
-## 5. Модель данных и миграции
+## 5. Data model and migrations
 
-Новых таблиц нет: используются `payments`/`payment_transitions` (4.1) и inbox (00003).
+No new tables: `payments`/`payment_transitions` (4.1) and inbox (00003) are used.
 
-## 6. Конечные автоматы
+## 6. State machines
 
-Цепочки FR-2 применяются строго через матрицу 4.1; событие не может перевести платеж
-в состояние, недостижимое по матрице.
+The FR-2 chains are applied strictly through the 4.1 matrix; an event cannot move a
+payment to a state unreachable by the matrix.
 
 ## 7. Edge cases
 
-Подтверждение раньше обнаружения (`pending -> detected -> confirming` одной командой);
-повтор `detected`/`confirmed` с новым `event_id` (self-переход, версия +1, журнал;
-дубли того же `event_id` отсекает inbox); `detected` после `completed` (stale, WARN,
-ack); `failed` после терминального (stale); `expired` после обнаружения (stale);
-`underpaid` из `pending` (цепочка из двух переходов); событие для
-`creating`/`created` (too early, ретраи); событие неизвестного платежа (ретраи,
-затем DLQ); конфликт версии из-за параллельного перехода (повтор плана, до 3);
-невалидный protobuf/сумма/актив (DLQ); актив в нижнем регистре (нормализуется);
-несовпадение актива/шкалы с ожидаемыми (DLQ); отсутствие суммы для денежных типов
-(DLQ); `confirmations` больше предела (DLQ); сверхдлинные идентификаторы (DLQ,
-в ошибках усекаются); неизвестный тип enum (ack); сбой обработки после первого
-перехода цепочки (откат всего вместе с inbox); терминальное состояние + неизвестный
-тип (ErrUnknownEvent в домене).
+A confirmation before detection (`pending -> detected -> confirming` in one command); a
+repeat of `detected`/`confirmed` with a new `event_id` (a self-transition, version +1,
+journal; duplicates of the same `event_id` are cut off by inbox); `detected` after
+`completed` (stale, WARN, ack); `failed` after terminal (stale); `expired` after
+detection (stale); `underpaid` from `pending` (a chain of two transitions); an event for
+`creating`/`created` (too early, retries); an event for an unknown payment (retries,
+then DLQ); a version conflict due to a concurrent transition (a plan retry, up to 3);
+invalid protobuf/amount/asset (DLQ); a lowercase asset (normalized); an asset/scale
+mismatch with the expected ones (DLQ); a missing amount for monetary types (DLQ);
+`confirmations` above the limit (DLQ); overlong identifiers (DLQ, truncated in errors);
+an unknown enum type (ack); a processing failure after the first transition of the chain
+(a rollback of everything together with inbox); a terminal state + an unknown type
+(ErrUnknownEvent in the domain).
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-Обработка без блокировок: чтение снимка + CAS-переходы (T-PAY-02); число записей к
-БД на событие - 1 чтение + 1 - 2 перехода; повторные конфликты ограничены 3
-попытками с последующей передачей в retry-механику; переходы и inbox-строка
-атомарны (транзакция Guard); сырое событие не логируется целиком (только payment_id,
-тип, версии); traceparent из заголовков конверта попадает в логи consumer-а
-(сквозная трассировка - 0.7).
+Lock-free processing: a snapshot read + CAS transitions (T-PAY-02); the number of DB
+operations per event - 1 read + 1 - 2 transitions; repeated conflicts are bounded by 3
+attempts with subsequent handover to the retry mechanics; transitions and the inbox row
+are atomic (the Guard transaction); the raw event is not logged in full (only payment_id,
+type, versions); traceparent from the envelope headers reaches the consumer logs
+(end-to-end tracing - 0.7).
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Unit (домен) | полная таблица FR-2: каждая пара (состояние, событие) - цепочка/stale/too early; неизвестный тип |
-| Unit (usecase) | фейковое хранилище: применение цепочки и патча, stale ack, too-early ошибка, повтор после конфликта версии, исчерпание попыток, невалидные события |
-| Integration | реальный PostgreSQL: handler применяет detected и сохраняет поля; confirmed-first цепочка; дубликат не меняет состояние и журнал; stale после завершения |
-| E2E | Kafka + PostgreSQL: канонические detected + confirmed из Kafka переводят платеж в `confirming`; дубликат записи не растит версию; устаревшее detected после терминального - no-op |
+| Unit (domain) | the complete FR-2 table: every (state, event) pair - a chain/stale/too early; an unknown type |
+| Unit (usecase) | fake storage: application of the chain and the patch, a stale ack, a too-early error, a retry after a version conflict, exhaustion of attempts, invalid events |
+| Integration | real PostgreSQL: the handler applies detected and saves the fields; a confirmed-first chain; a duplicate does not change the state and journal; stale after completion |
+| E2E | Kafka + PostgreSQL: canonical detected + confirmed from Kafka move the payment to `confirming`; a record duplicate does not grow the version; a stale detected after terminal - no-op |
 | Load | 14.1 |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Тесты вперед (домен, usecase, integration, e2e), затем domain/canonical.go,
-usecase/canonical_consumer.go, обвязка main. Коммит
-`CBL-4.3: consumer канонических событий с защитой от дублей и порядка`;
-спека в том же коммите.
+Tests first (domain, usecase, integration, e2e), then domain/canonical.go,
+usecase/canonical_consumer.go, main wiring. Commit
+`CBL-4.3: canonical event consumer with duplicate and ordering protection`; the spec is
+in the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- Порог подтверждений (4.5) заменит self-переход `confirming` на `completed` по
-  сумме; 4.3 сохраняет `confirmations` (предел 1 000 000 - защита от подделки).
-- Перепроверка `GetGatewayPayment` перед `completed` - 4.4 (вызов Connector 3.2,
-  заблокирован KI-01): 4.3 не вызывает Connector.
-- Границы доверия Kafka: события не подписаны, дедупликация по `event_id` из
-  заголовка; участник с produce-правами может двигать состояния до `confirming`
-  и терминальных, но не `completed` (4.4/4.5); ACL/mTLS - 0.5/0.6 (KI-payment-04).
-- Too-early событие опирается на номинальные retry-паузы 5s/1m/10m: если платеж
-  долго остается в `creating`/`created` (таймаут CreateInvoice, 4.6), валидное
-  событие уйдет в DLQ и потребует ручного replay (KI-payment-05, runbook).
-- Отложенная обработка retry-топиков (отдельные паузы вместо мгновенного чтения
-  тем же консьюмером) - общая тема kit (как в 2.7), вне 4.3.
+- The confirmation threshold (4.5) will replace the `confirming` self-transition with
+  `completed` by amount; 4.3 keeps `confirmations` (the limit 1 000 000 - protection
+  against forgery).
+- The re-check of `GetGatewayPayment` before `completed` - 4.4 (a Connector 3.2 call,
+  blocked by KI-01): 4.3 does not call Connector.
+- Kafka trust boundaries: events are not signed, deduplication is by `event_id` from the
+  header; a participant with produce rights can move states up to `confirming` and
+  terminal ones, but not `completed` (4.4/4.5); ACL/mTLS - 0.5/0.6 (KI-payment-04).
+- A too-early event relies on nominal retry pauses 5s/1m/10m: if the payment stays in
+  `creating`/`created` for a long time (a CreateInvoice timeout, 4.6), a valid event
+  will go to the DLQ and require a manual replay (KI-payment-05, runbook).
+- Deferred processing of retry topics (separate pauses instead of immediate reading by
+  the same consumer) - a common kit topic (as in 2.7), out of 4.3.
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (15.10.2026). Блокеров нет. MAJOR всех ролей
-(атомарность inbox и переходов) закрыт переходом на транзакцию Guard: consumer и
-репозиторий получили tx-aware методы (`PaymentTx`/`TransitionTx`), добавлен
-integration-тест отката; MAJOR недоверенного входа закрыты нормализацией актива,
-сверкой с ожидаемыми реквизитами платежа, требованием суммы для денежных типов,
-пределом `confirmations` и усечением идентификаторов в ошибках; MAJOR границ
-доверия Kafka зафиксирован в KI-payment-04; MAJOR poison-цикла (раздувание
-x-error) закрыт усечением; MINOR/NIT закрыты тестами (lowercase, mismatch,
-missing received, huge confirmations, все типы enum, confirmed-first,
-дубликаты через Guard, атомарность), целью `make test-e2e`, пулом БД, WARN для
-stale и обновлением документации.
+Four independent passes (15.10.2026). No blockers. The MAJOR of all roles (atomicity of
+inbox and transitions) is closed by moving to the Guard transaction: the consumer and
+the repository got tx-aware methods (`PaymentTx`/`TransitionTx`), a rollback integration
+test was added; MAJORs of untrusted input are closed by asset normalization,
+reconciliation with the expected payment details, the amount requirement for monetary
+types, the `confirmations` limit and identifier truncation in errors; the MAJOR of Kafka
+trust boundaries is recorded in KI-payment-04; the MAJOR of the poison loop (x-error
+inflation) is closed by truncation; MINOR/NIT are closed by tests (lowercase, mismatch,
+missing received, huge confirmations, all enum types, confirmed-first, duplicates via
+Guard, atomicity), the `make test-e2e` target, the DB pool, WARN for stale and
+documentation updates.
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | MAJOR: tx Guard игнорируется (неатомарно); confirmations для underpaid/overpaid теряются; stale логируется Info; traceparent не реализован; отсутствие суммы принимается; lowercase asset падает на DB CHECK; недостающие integration-тесты; e2e вне Makefile; FR-3 против кода; network вне FR-3; мертвый код; sleep-и в e2e | tx-aware методы + атомарный тест; confirmations только для detected/confirmed (спека); Warn; traceparent в логах; сумма обязательна для денежных типов; нормализация + сверка; тесты добавлены; `make test-e2e`; FR-3 уточнен; network в FR-3; мертвый код убран; e2e через inbox-маркеры |
-| Архитектуры | MAJOR: атомарность; lowercase asset; traceparent; порядок по gateway_event_ts не реализован (T-CONNECTOR-05); AGENTS не обновлен; MINOR: патч на последнем шаге vs FR-3, Info, integration-план, e2e вне make, too-early бюджет; NIT: неизвестный тип в терминальном, лишний timeline в Get, пул БД | атомарность + T-PAY-04; нормализация; traceparent; монотонность по времени события делегирована 4.5 (спека §11), T-CONNECTOR-05 согласован; AGENTS обновлен; FR-3 приведен к коду; Warn; тесты; make; KI-payment-05; unknown-first в PlanEvent; `PaymentTx` без истории; пул настроен |
-| С контекстом | MAJOR: lowercase asset (последний барьер); документация шага 7; MINOR: AGENTS содержимое, WARN, FR-3/код/network/confirmations, integration confirmed-first, network без differ-теста, покрытие canonicalType, traceparent; NIT: мертвый код, дубли helpers, sleep, узкий интерфейс, fmt.Sprintf | нормализация + mismatch-тест; Makefile/AGENTS; журнал/T-PAY-04/KI/runbook; Warn; спека синхронизирована; тесты добавлены (network erc20, chain, duplicates); таблица типов; traceparent; убрано; helpers оставлены (разные пакеты, NIT); inbox-маркеры; `PaymentTx`; `fmt.Sprintf` убран |
-| Безопасности | MAJOR: атомарность; MAJOR: сумма/актив/network не сверяются с ожидаемыми; MAJOR: границы доверия Kafka; MAJOR: poison-цикл размера x-error; MINOR: confirmations без предела, длины строк, self-переходы при новом event_id, граничные тесты, номинальные ретраи | атомарность; сверка asset/decimals с expected (network патчится осознанно); KI-payment-04; усечение идентификаторов (краткое payment_id, лимиты 256); предел confirmations 1e6; лимиты полей; self-переходы задокументированы (4.5 читает сумму перед терминалом); тесты границ; KI-payment-05 |
+| No context | MAJOR: the tx Guard is ignored (non-atomic); confirmations for underpaid/overpaid are lost; stale is logged at Info; traceparent not implemented; a missing amount is accepted; a lowercase asset fails on the DB CHECK; missing integration tests; e2e outside the Makefile; FR-3 vs the code; network outside FR-3; dead code; sleeps in e2e | tx-aware methods + an atomicity test; confirmations only for detected/confirmed (spec); Warn; traceparent in the logs; the amount is mandatory for monetary types; normalization + reconciliation; tests added; `make test-e2e`; FR-3 clarified; network in FR-3; dead code removed; e2e via inbox markers |
+| Architecture | MAJOR: atomicity; lowercase asset; traceparent; ordering by gateway_event_ts not implemented (T-CONNECTOR-05); AGENTS not updated; MINOR: patch at the last step vs FR-3, Info, the integration plan, e2e outside make, the too-early budget; NIT: an unknown type in terminal, an extra timeline in Get, the DB pool | atomicity + T-PAY-04; normalization; traceparent; monotonicity by event time is delegated to 4.5 (spec §11), T-CONNECTOR-05 is reconciled; AGENTS updated; FR-3 aligned with the code; Warn; tests; make; KI-payment-05; unknown-first in PlanEvent; `PaymentTx` without history; the pool configured |
+| With context | MAJOR: lowercase asset (the last barrier); step 7 documentation; MINOR: AGENTS content, WARN, FR-3/code/network/confirmations, integration confirmed-first, network without a differ test, canonicalType coverage, traceparent; NIT: dead code, duplicate helpers, sleep, a narrow interface, fmt.Sprintf | normalization + a mismatch test; Makefile/AGENTS; journal/T-PAY-04/KI/runbook; Warn; the spec is synchronized; tests added (network erc20, chain, duplicates); the type table; traceparent; removed; helpers kept (different packages, NIT); inbox markers; `PaymentTx`; `fmt.Sprintf` removed |
+| Security | MAJOR: atomicity; MAJOR: amount/asset/network are not reconciled with the expected ones; MAJOR: Kafka trust boundaries; MAJOR: the poison loop of the x-error size; MINOR: confirmations without a limit, string lengths, self-transitions with a new event_id, boundary tests, nominal retries | atomicity; reconciliation of asset/decimals with expected (network is patched deliberately); KI-payment-04; identifier truncation (a short payment_id, limits 256); the confirmations limit 1e6; field limits; self-transitions documented (4.5 reads the amount before terminal); boundary tests; KI-payment-05 |

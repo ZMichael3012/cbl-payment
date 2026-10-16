@@ -1,5 +1,5 @@
-// Пакет grpcserver содержит gRPC-транспортный слой сервиса payment:
-// валидацию недоверенного ввода и маппинг доменных ошибок в gRPC-статусы.
+// Package grpcserver contains the gRPC transport layer of the payment service:
+// validation of untrusted input and mapping of domain errors to gRPC statuses.
 package grpcserver
 
 import (
@@ -21,26 +21,27 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// Пределы недоверенного ввода транспорта.
+// Untrusted transport input limits.
 const (
 	maxMerchantIDLen = 256
 	maxCursorLen     = 256
 )
 
-// Payment реализует gRPC-сервис PaymentService. CreatePayment и CancelPayment
-// появятся в 4.2 (заблокирован KI-01, шлюз); чтения реализованы в 4.8.
+// Payment implements the PaymentService gRPC service. CreatePayment and
+// CancelPayment will appear in 4.2 (blocked by KI-01, the gateway); the reads
+// are implemented in 4.8.
 type Payment struct {
 	paymentv1.UnimplementedPaymentServiceServer
 	query *usecase.PaymentQuery
 }
 
-// NewPayment создает сервер PaymentService.
+// NewPayment creates the PaymentService server.
 func NewPayment(query *usecase.PaymentQuery) *Payment {
 	return &Payment{query: query}
 }
 
-// GetPayment возвращает платеж с историей переходов и зафиксированной
-// котировкой (rate, locked_until).
+// GetPayment returns a payment with the transition history and the locked
+// quote (rate, locked_until).
 func (s *Payment) GetPayment(ctx context.Context, req *paymentv1.GetPaymentRequest) (*paymentv1.GetPaymentResponse, error) {
 	paymentID := strings.TrimSpace(req.GetPaymentId())
 	parsed, err := uuid.Parse(paymentID)
@@ -54,8 +55,8 @@ func (s *Payment) GetPayment(ctx context.Context, req *paymentv1.GetPaymentReque
 	return &paymentv1.GetPaymentResponse{Payment: paymentToProto(payment, history)}, nil
 }
 
-// ListPayments возвращает страницу платежей мерчанта (4.8): фильтры владельца,
-// состояния и периода создания (from включительно, to исключительно).
+// ListPayments returns a page of merchant payments (4.8): filters by owner,
+// state and creation period (from inclusive, to exclusive).
 func (s *Payment) ListPayments(ctx context.Context, req *paymentv1.ListPaymentsRequest) (*paymentv1.ListPaymentsResponse, error) {
 	merchantID := strings.TrimSpace(req.GetMerchantId())
 	if merchantID == "" {
@@ -100,7 +101,7 @@ func (s *Payment) ListPayments(ctx context.Context, req *paymentv1.ListPaymentsR
 	return response, nil
 }
 
-// paymentToProto собирает контрактный платеж; timeline заполняется только Get.
+// paymentToProto assembles the contract payment; the timeline is filled only by Get.
 func paymentToProto(payment storage.Payment, history []storage.Transition) *paymentv1.Payment {
 	result := &paymentv1.Payment{
 		PaymentId:      payment.ID,
@@ -135,9 +136,9 @@ func paymentToProto(payment storage.Payment, history []storage.Transition) *paym
 	if payment.ReceivedAmount != nil && payment.ReceivedAsset != nil && payment.ReceivedDecimals != nil {
 		result.ReceivedAmount = money(*payment.ReceivedAmount, *payment.ReceivedAsset, *payment.ReceivedDecimals)
 	}
-	// Fee в Payment v1 не выносится: правила комиссии не определены
-	// (KI-payment-06); отдельного REST-поля fee в инвойсе нет - webhook-поле
-	// питается payment.events (CF-2).
+	// Fee is not exposed in Payment v1: the fee rules are undefined
+	// (KI-payment-06); there is no separate REST fee field in the invoice - the
+	// webhook field is fed by payment.events (CF-2).
 	for _, item := range history {
 		result.Timeline = append(result.Timeline, &paymentv1.TimelineItem{
 			State:      stateToProto(domain.State(item.ToState)),
@@ -148,7 +149,7 @@ func paymentToProto(payment storage.Payment, history []storage.Transition) *paym
 	return result
 }
 
-// money собирает контрактную сумму с активом и шкалой.
+// money assembles the contract amount with the asset and the scale.
 func money(units int64, asset string, decimals int) *commonv1.Money {
 	scale := decimals
 	if scale < 0 {
@@ -157,7 +158,7 @@ func money(units int64, asset string, decimals int) *commonv1.Money {
 	return &commonv1.Money{MinorUnits: units, Asset: asset, Decimals: uint32(scale)} //nolint:gosec // CHECK 0 - 18
 }
 
-// stateToProto переводит доменное состояние в контрактное.
+// stateToProto converts a domain state to the contract one.
 func stateToProto(state domain.State) paymentv1.PaymentState {
 	switch state {
 	case domain.StateCreating:
@@ -187,8 +188,8 @@ func stateToProto(state domain.State) paymentv1.PaymentState {
 	}
 }
 
-// stateFilter переводит необязательный контрактный фильтр состояния:
-// UNSPECIFIED означает отсутствие фильтра, неизвестное значение отклоняется.
+// stateFilter converts the optional contract state filter: UNSPECIFIED means
+// no filter, an unknown value is rejected.
 func stateFilter(state paymentv1.PaymentState) (*domain.State, error) {
 	if state == paymentv1.PaymentState_PAYMENT_STATE_UNSPECIFIED {
 		return nil, nil
@@ -200,8 +201,8 @@ func stateFilter(state paymentv1.PaymentState) (*domain.State, error) {
 	return &mapped, nil
 }
 
-// stateFromProto переводит контрактное состояние в доменное (пусто для
-// неизвестных значений).
+// stateFromProto converts a contract state to the domain one (empty for
+// unknown values).
 func stateFromProto(state paymentv1.PaymentState) domain.State {
 	switch state {
 	case paymentv1.PaymentState_PAYMENT_STATE_CREATING:
@@ -231,8 +232,8 @@ func stateFromProto(state paymentv1.PaymentState) domain.State {
 	}
 }
 
-// optionalTimestamp переводит необязательную временную границу запроса;
-// невалидная метка отклоняется единым кодом invalid_period.
+// optionalTimestamp converts the optional request time bound; an invalid
+// timestamp is rejected with the single invalid_period code.
 func optionalTimestamp(ts *timestamppb.Timestamp) (*time.Time, error) {
 	if ts == nil {
 		return nil, nil
@@ -244,7 +245,7 @@ func optionalTimestamp(ts *timestamppb.Timestamp) (*time.Time, error) {
 	return &value, nil
 }
 
-// mapPaymentError переводит ошибки хранилища в ошибки платформы.
+// mapPaymentError converts storage errors to platform errors.
 func mapPaymentError(err error) error {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):

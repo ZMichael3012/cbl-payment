@@ -12,7 +12,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/domain"
 )
 
-// allStates задает канонические состояния автомата.
+// allStates defines the canonical state machine states.
 var allStates = []domain.State{
 	domain.StateCreating,
 	domain.StateCreated,
@@ -27,7 +27,7 @@ var allStates = []domain.State{
 	domain.StateCancelled,
 }
 
-// allowedPairs задает матрицу переходов (FR-3) в виде пар "from>to".
+// allowedPairs defines the transition matrix (FR-3) as "from>to" pairs.
 var allowedPairs = map[string]struct{}{
 	"creating>created":     {},
 	"creating>cancelled":   {},
@@ -55,7 +55,7 @@ func TestParseState(t *testing.T) {
 
 	for _, state := range allStates {
 		parsed, err := domain.ParseState(string(state))
-		require.NoErrorf(t, err, "состояние %s", state)
+		require.NoErrorf(t, err, "state %s", state)
 		assert.Equal(t, state, parsed)
 	}
 	_, err := domain.ParseState("unknown")
@@ -71,7 +71,7 @@ func TestTransitionMatrix(t *testing.T) {
 		for _, to := range allStates {
 			_, want := allowedPairs[string(from)+">"+string(to)]
 			assert.Equalf(t, want, domain.AllowedTransition(from, to),
-				"переход %s -> %s", from, to)
+				"transition %s -> %s", from, to)
 		}
 	}
 }
@@ -84,14 +84,14 @@ func TestTerminal(t *testing.T) {
 		domain.StateOverpaid, domain.StateFailed, domain.StateCancelled,
 	}
 	for _, state := range terminal {
-		assert.Truef(t, domain.Terminal(state), "%s должен быть терминальным", state)
+		assert.Truef(t, domain.Terminal(state), "%s must be terminal", state)
 	}
 	active := []domain.State{
 		domain.StateCreating, domain.StateCreated, domain.StatePending,
 		domain.StateDetected, domain.StateConfirming,
 	}
 	for _, state := range active {
-		assert.Falsef(t, domain.Terminal(state), "%s не терминальный", state)
+		assert.Falsef(t, domain.Terminal(state), "%s is not terminal", state)
 	}
 }
 
@@ -104,22 +104,22 @@ func TestNextVersion(t *testing.T) {
 
 	version, err = domain.NextVersion(domain.StateConfirming, domain.StateConfirming, 5)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(6), version, "самопереход увеличивает версию")
+	assert.Equal(t, uint64(6), version, "a self-transition increments the version")
 
 	_, err = domain.NextVersion(domain.StateConfirming, domain.StateDetected, 5)
-	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "переход назад запрещен")
+	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "a backward transition is forbidden")
 
 	_, err = domain.NextVersion(domain.StateCompleted, domain.StateCompleted, 5)
-	require.ErrorIs(t, err, domain.ErrTerminalState, "терминальное состояние неизменяемо")
+	require.ErrorIs(t, err, domain.ErrTerminalState, "a terminal state is immutable")
 
 	_, err = domain.NextVersion(domain.StatePending, domain.StateCompleted, 2)
-	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "перескок через состояние запрещен")
+	require.ErrorIs(t, err, domain.ErrForbiddenTransition, "skipping a state is forbidden")
 
 	_, err = domain.NextVersion(domain.StateCreating, domain.StateCreated, 0)
 	require.ErrorIs(t, err, domain.ErrStateConflict)
 
 	_, err = domain.NextVersion("unknown", "unknown", 1)
-	require.ErrorIs(t, err, domain.ErrInvalidState, "неизвестное состояние не проходит самопереходом")
+	require.ErrorIs(t, err, domain.ErrInvalidState, "an unknown state does not pass as a self-transition")
 
 	_, err = domain.NextVersion(domain.StatePending, "unknown", 2)
 	require.ErrorIs(t, err, domain.ErrInvalidState)
@@ -138,9 +138,9 @@ func TestStateMatchesProtoEnum(t *testing.T) {
 	require.Len(t, protoStates, len(allStates))
 	for _, state := range allStates {
 		_, ok := protoStates[string(state)]
-		assert.Truef(t, ok, "состояние %s отсутствует в billing.payment.v1.PaymentState", state)
+		assert.Truef(t, ok, "state %s is missing in billing.payment.v1.PaymentState", state)
 	}
 	assert.Equal(t, paymentv1.PaymentState_PAYMENT_STATE_CONFIRMING,
 		paymentv1.PaymentState(paymentv1.PaymentState_value["PAYMENT_STATE_"+strings.ToUpper(string(domain.StateConfirming))]),
-		"маппинг состояний 1:1 по именам")
+		"state mapping is 1:1 by names")
 }

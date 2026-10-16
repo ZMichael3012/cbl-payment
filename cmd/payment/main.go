@@ -1,4 +1,4 @@
-// main запускает HTTP- и gRPC-сервис payment платформы CBL.
+// main starts the HTTP and gRPC payment service of the CBL platform.
 package main
 
 import (
@@ -38,7 +38,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// main поднимает gRPC-сервер сервиса, административный HTTP-сервер и сервер метрик.
+// main brings up the service gRPC server, the administrative HTTP server and the metrics server.
 func main() {
 	log, err := zap.NewProduction()
 	if err != nil {
@@ -57,8 +57,8 @@ func main() {
 		return
 	}
 
-	// Пул ограничен по образцу леджера (T-LED-04): consumer и gRPC делят
-	// соединения, опечатка в env не должна исчерпать max_connections.
+	// The pool is bounded following the ledger pattern (T-LED-04): the consumer
+	// and gRPC share connections, a typo in env must not exhaust max_connections.
 	sqlDB, err := db.DB()
 	if err != nil {
 		log.Error("resolve sql db failed", zap.Error(err))
@@ -248,7 +248,7 @@ func main() {
 	log.Info("shutdown finished")
 }
 
-// metricsHandler отдает заглушку метрик до задачи 0.7.
+// metricsHandler serves a metrics stub until task 0.7.
 func metricsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
@@ -258,7 +258,7 @@ func metricsHandler() http.Handler {
 	return mux
 }
 
-// getenv возвращает значение переменной окружения или значение по умолчанию.
+// getenv returns the environment variable value or the fallback value.
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -266,8 +266,8 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-// getenvInt возвращает положительное целое из переменной окружения
-// или значение по умолчанию.
+// getenvInt returns a positive integer from the environment variable
+// or the fallback value.
 func getenvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -277,9 +277,9 @@ func getenvInt(key string, fallback int) int {
 	return fallback
 }
 
-// parseToleranceBPS разбирает толеранс в базисных пунктах: пустое значение - 0,
-// невалидное или вне диапазона 0 - 10000 - ошибка: денежное решение не должно
-// молча деградировать из-за опечатки в конфигурации.
+// parseToleranceBPS parses a tolerance in basis points: an empty value means 0,
+// an invalid value or one outside the range 0 to 10000 is an error: a money
+// decision must not silently degrade because of a configuration typo.
 func parseToleranceBPS(raw string) (int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -292,11 +292,11 @@ func parseToleranceBPS(raw string) (int, error) {
 	return value, nil
 }
 
-// parseDurationEnv разбирает длительность из переменной окружения: пустое
-// значение - значение по умолчанию; невалидное, отрицательное или меньше
-// минимума - ошибка; ноль допускается только при allowZero (интервал janitor-а:
-// 0 - выключен). Минимумы защищают от опечаток вроде PAYMENT_CREATING_TIMEOUT=1s,
-// которые массово закрывали бы живые создания 4.2.
+// parseDurationEnv parses a duration from the environment variable: an empty
+// value means the fallback; an invalid, negative or below-minimum value is an
+// error; zero is allowed only when allowZero is set (janitor interval:
+// 0 means disabled). The minimums protect against typos like
+// PAYMENT_CREATING_TIMEOUT=1s that would close live 4.2 creations in bulk.
 func parseDurationEnv(key string, fallback, minimum time.Duration, allowZero bool) (time.Duration, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -315,9 +315,9 @@ func parseDurationEnv(key string, fallback, minimum time.Duration, allowZero boo
 	return value, nil
 }
 
-// parseBatchEnv разбирает размер пакета janitor-а: пустое значение - значение
-// по умолчанию; невалидное или неположительное - ошибка (потолок проверяет
-// usecase.NewJanitor).
+// parseBatchEnv parses the janitor batch size: an empty value means the
+// fallback; an invalid or non-positive value is an error (the ceiling is
+// validated by usecase.NewJanitor).
 func parseBatchEnv(key string, fallback int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -330,8 +330,8 @@ func parseBatchEnv(key string, fallback int) (int, error) {
 	return value, nil
 }
 
-// splitCSV разбирает список значений из переменной окружения через запятую,
-// отбрасывая пустые элементы и пробелы вокруг них.
+// splitCSV parses a comma-separated list of values from the environment
+// variable, dropping empty elements and surrounding whitespace.
 func splitCSV(raw string) []string {
 	parts := strings.Split(raw, ",")
 	values := make([]string, 0, len(parts))

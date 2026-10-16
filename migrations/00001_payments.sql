@@ -78,8 +78,8 @@ BEGIN
         RAISE EXCEPTION 'payments: state_version must increment by 1 (got % -> %)',
             OLD.state_version, NEW.state_version;
     END IF;
-    -- Самопереход (обновление confirmations и т.п.) допустим только в нетерминальных
-    -- состояниях; терминальные состояния неизменяемы.
+    -- A self-transition (confirmations update and so on) is allowed only in
+    -- non-terminal states; terminal states are immutable.
     IF NEW.state = OLD.state THEN
         IF OLD.state IN ('completed', 'expired', 'underpaid', 'overpaid', 'failed', 'cancelled') THEN
             RAISE EXCEPTION 'payments: terminal state % is immutable', OLD.state;

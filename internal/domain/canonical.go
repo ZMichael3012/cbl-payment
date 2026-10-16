@@ -5,38 +5,38 @@ import (
 	"fmt"
 )
 
-// CanonicalEventType задает тип канонического события шлюза.
+// CanonicalEventType defines the type of a canonical gateway event.
 type CanonicalEventType string
 
-// Канонические типы событий соответствуют billing.events.v1.CanonicalPaymentEvent.
+// Canonical event types correspond to billing.events.v1.CanonicalPaymentEvent.
 const (
-	// CanonicalDetected задает обнаружение оплаты в сети.
+	// CanonicalDetected defines detection of a payment on the network.
 	CanonicalDetected CanonicalEventType = "detected"
-	// CanonicalConfirmed задает подтверждение оплаты сетью.
+	// CanonicalConfirmed defines confirmation of the payment by the network.
 	CanonicalConfirmed CanonicalEventType = "confirmed"
-	// CanonicalFailed задает неуспех платежа у шлюза или в сети.
+	// CanonicalFailed defines a payment failure at the gateway or on the network.
 	CanonicalFailed CanonicalEventType = "failed"
-	// CanonicalExpired задает истечение срока счета без оплаты.
+	// CanonicalExpired defines expiry of the invoice without payment.
 	CanonicalExpired CanonicalEventType = "expired"
-	// CanonicalUnderpaid задает оплату меньше ожидаемой суммы.
+	// CanonicalUnderpaid defines a payment smaller than the expected amount.
 	CanonicalUnderpaid CanonicalEventType = "underpaid"
-	// CanonicalOverpaid задает оплату больше ожидаемой суммы.
+	// CanonicalOverpaid defines a payment larger than the expected amount.
 	CanonicalOverpaid CanonicalEventType = "overpaid"
 )
 
-// Ошибки обработки канонических событий.
+// Errors of canonical event handling.
 var (
-	// ErrEventTooEarly сообщает, что событие опередило создание счета:
-	// обработку нужно повторить после перехода платежа в pending.
+	// ErrEventTooEarly reports that the event arrived before invoice creation:
+	// handling must be retried after the payment transitions to pending.
 	ErrEventTooEarly = errors.New("payment: canonical event arrived too early")
-	// ErrUnknownEvent сообщает о неизвестном типе канонического события.
+	// ErrUnknownEvent reports an unknown canonical event type.
 	ErrUnknownEvent = errors.New("payment: unknown canonical event type")
 )
 
-// PlanEvent строит цепочку переходов автомата для канонического события.
-// Пустая цепочка без ошибки означает устаревшее событие (идемпотентный no-op):
-// текущее состояние уже дальше события или терминально. ErrEventTooEarly
-// возвращается для creating/created: событие повторится через retry-топики.
+// PlanEvent builds the state machine transition chain for a canonical event.
+// An empty chain without an error means a stale event (idempotent no-op):
+// the current state is already ahead of the event or terminal. ErrEventTooEarly
+// is returned for creating/created: the event will be retried through retry topics.
 func PlanEvent(current State, event CanonicalEventType) ([]State, error) {
 	switch event {
 	case CanonicalDetected, CanonicalConfirmed, CanonicalFailed,
@@ -61,8 +61,8 @@ func PlanEvent(current State, event CanonicalEventType) ([]State, error) {
 	case CanonicalConfirmed:
 		switch current {
 		case StatePending:
-			// Подтверждение раньше обнаружения: применяем минимальную
-			// допустимую цепочку detected -> confirming.
+			// Confirmation before detection: apply the minimal
+			// allowed chain detected -> confirming.
 			return []State{StateDetected, StateConfirming}, nil
 		case StateDetected, StateConfirming:
 			return []State{StateConfirming}, nil
@@ -75,7 +75,7 @@ func PlanEvent(current State, event CanonicalEventType) ([]State, error) {
 		if current == StatePending {
 			return []State{StateExpired}, nil
 		}
-		// Оплата уже обнаружена: истечение счета устарело.
+		// The payment has already been detected: the invoice expiry is stale.
 		return nil, nil
 	case CanonicalUnderpaid:
 		if current == StatePending {

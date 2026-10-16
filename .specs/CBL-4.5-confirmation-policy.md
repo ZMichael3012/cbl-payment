@@ -1,177 +1,178 @@
-# CBL-4.5. Правила: пороги подтверждений, недоплата, переплата, истечение
+# CBL-4.5. Rules: confirmation thresholds, underpayment, overpayment, expiration
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E4, Payment Service |
-| Репозиторий | `cbl-payment` |
-| Размер | M |
-| Волна и параллельная группа | W2-PAYMENT |
-| Зависит от | 4.3 |
-| Версия контрактов | `cbl-protos@cf-2` (`billing/events/v1`), `CBL-000` раздел 7 |
-| Статус | done, ревью закрыто |
+| Epic | E4, Payment Service |
+| Repository | `cbl-payment` |
+| Size | M |
+| Wave and parallel group | W2-PAYMENT |
+| Depends on | 4.3 |
+| Contract version | `cbl-protos@cf-2` (`billing/events/v1`), `CBL-000` section 7 |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Канонические события суть вход, но финальное решение о `completed`/`underpaid`/
-`overpaid` принимает политика платформы (`CBL-000`, раздел 7: «1 для менее $100,
-3 для $100 - 1000, 6 для более $1000»; «недоплата и переплата - отдельный
-сценарий»). Задача добавляет правило принятия решения: порог подтверждений по
-сумме, толерансы по недоплате/переплате, правило истечения; consumer 4.3 начинает
-завершать платежи сам, а не оставлять их в `confirming` навсегда.
+Canonical events are the input, but the final decision on `completed`/`underpaid`/
+`overpaid` is made by the platform policy (`CBL-000`, section 7: "1 for less than $100,
+3 for $100 - 1000, 6 for more than $1000"; "underpayment and overpayment are a separate
+scenario"). The task adds a decision rule: a confirmation threshold by amount,
+underpayment/overpayment tolerances, an expiration rule; consumer 4.3 starts completing
+payments itself instead of leaving them in `confirming` forever.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: доменная политика (пороги по активу и сумме, толерансы, истечение),
-интеграция политики в consumer 4.3, конфигурация, тесты.
-Out of scope: перепроверка `GetGatewayPayment` перед завершением (4.4, KI-01),
-фоновые задачи истечения (4.6 - вызов предиката политики), публикация
-`payment.events` (4.7), USD-курс как источник порогов (KI-01/0.6), комиссия
-платформы (отдельное решение, fee = 0 в 4.5).
+In scope: the domain policy (thresholds by asset and amount, tolerances, expiration),
+integration of the policy into consumer 4.3, configuration, tests.
+Out of scope: the re-check of `GetGatewayPayment` before completion (4.4, KI-01),
+background expiration tasks (4.6 - the predicate call of the policy), `payment.events`
+publication (4.7), the USD rate as a threshold source (KI-01/0.6), the platform fee
+(a separate decision, fee = 0 in 4.5).
 
-## 3. Функциональные требования
+## 3. Functional requirements
 
-FR-1. Конфигурация порогов: `PAYMENT_CONFIRMATION_POLICY` - JSON вида
+FR-1. Threshold configuration: `PAYMENT_CONFIRMATION_POLICY` - JSON of the form
 `{"USDT":[{"below_minor":10000,"confirmations":1},{"below_minor":100000,"confirmations":3}],"default":6}`.
-Границы ярусов задаются в минимальных единицах ожидаемого актива в его канонических
-decimals (пример выше - для актива с двумя знаками; для USDT с 6 знаками ярусы
-масштабируются); порог выбирается по ожидаемому активу и сумме платежа: первый ярус,
-где `expected < below_minor`, иначе - `default` (по умолчанию 6, диапазон 1 - 1000;
-на границе яруса `expected == below_minor` действует следующий ярус). Невалидная
-конфигурация (плохой JSON, `null`, порог вне диапазона, дубликаты активов после
-нормализации регистра, пустые ярусы) - сервис не стартует; ключ `default`
-распознается без учета регистра. Эффективная политика логируется один раз при
-старте. Для волатильных активов ярусы задаются оператором в единицах актива по
-USD-эквиваленту на момент настройки (`CBL-000`; автоматический feed - KI-payment-06).
+Tier boundaries are specified in minor units of the expected asset in its canonical
+decimals (the example above is for an asset with two digits; for USDT with 6 digits the
+tiers are scaled); the threshold is selected by the expected asset and the payment
+amount: the first tier where `expected < below_minor`, otherwise `default` (6 by
+default, range 1 - 1000; at a tier boundary `expected == below_minor` the next tier
+applies). An invalid configuration (bad JSON, `null`, a threshold out of range,
+duplicate assets after case normalization, empty tiers) - the service does not start;
+the `default` key is recognized case-insensitively. The effective policy is logged once
+at startup. For volatile assets tiers are specified by the operator in asset units
+based on the USD equivalent at the time of configuration (`CBL-000`; an automatic feed -
+KI-payment-06).
 
-FR-2. Толерансы: `PAYMENT_UNDERPAID_TOLERANCE_BPS` и
-`PAYMENT_OVERPAID_TOLERANCE_BPS` (базисные пункты, 0 - 10000, по умолчанию 0;
-невалидное значение - отказ старта). Допустимое отклонение считается без float:
+FR-2. Tolerances: `PAYMENT_UNDERPAID_TOLERANCE_BPS` and
+`PAYMENT_OVERPAID_TOLERANCE_BPS` (basis points, 0 - 10000, 0 by default; an invalid
+value - startup refusal). The admissible deviation is computed without float:
 `underLimit = expected - floor(expected * underBPS / 10000)`,
-`overLimit = expected + floor(expected * overBPS / 10000)`. Недоплата в пределах
-толеранса трактуется как полная оплата (платеж может завершиться `completed`),
-переплата в пределах - так же; сверх толеранса - терминальные
-`underpaid`/`overpaid`. Толеранс недоплаты 10000 bps принимает любую сумму
-(осознанное, документированное решение оператора).
+`overLimit = expected + floor(expected * overBPS / 10000)`. An underpayment within the
+tolerance is treated as full payment (the payment can complete as `completed`), an
+overpayment within it likewise; beyond the tolerance - terminal `underpaid`/`overpaid`.
+An underpayment tolerance of 10000 bps accepts any amount (a deliberate, documented
+operator decision).
 
-FR-3. Решение политики `Decide(received, expected, confirmations, required)`:
-- `received < underLimit` -> `underpaid` (немедленно, порог подтверждений не важен:
-  сумма недостаточна);
-- `received > overLimit` -> `overpaid` (немедленно);
-- иначе сумма принята: `confirmations >= required` -> `completed`,
-  иначе `confirming` (платеж продолжает набор; повторное событие обновляет
-  `confirmations` self-переходом).
+FR-3. Policy decision `Decide(received, expected, confirmations, required)`:
+- `received < underLimit` -> `underpaid` (immediately, the confirmation threshold does
+  not matter: the amount is insufficient);
+- `received > overLimit` -> `overpaid` (immediately);
+- otherwise the amount is accepted: `confirmations >= required` -> `completed`,
+  otherwise `confirming` (the payment keeps collecting; a repeated event updates
+  `confirmations` by a self-transition).
 
-FR-4. Consumer 4.3 использует политику для событий `confirmed`,
-`underpaid`, `overpaid`: политика платформы главнее классификации Connector
-(недоплата в пределах толеранса завершается `completed`; переплата в пределах
-толеранса - также `completed`). События `detected`, `failed`, `expired` и правила
-устаревания/too-early остаются как в 4.3. Целевое состояние достигается
-кратчайшей допустимой цепочкой матрицы (`pending -> detected -> confirming ->
-completed` и т.п.), CAS и транзакция Guard сохраняются.
+FR-4. Consumer 4.3 uses the policy for the events `confirmed`, `underpaid`, `overpaid`:
+the platform policy takes precedence over the Connector classification (an underpayment
+within the tolerance completes as `completed`; an overpayment within the tolerance
+likewise `completed`). The events `detected`, `failed`, `expired` and the staleness/
+too-early rules remain as in 4.3. The target state is reached by the shortest admissible
+chain of the matrix (`pending -> detected -> confirming -> completed`, etc.), CAS and
+the Guard transaction are preserved.
 
-FR-5. Истечение: платеж истекает, когда `expires_at` задан, `now >= expires_at` и
-состояние `created` или `pending` (счет создан, оплата не обнаружена);
-`creating` не истекает (доводится 4.6 до `created` или `failed`); после
-`detected` истечение не применяется. Домен предоставляет предикат
-`ShouldExpire(state, expiresAt, now)`; сами переходы выполняет 4.6 (перед
-истечением задача перечитывает состояние под CAS: платеж, ставший `detected`,
-не истекает).
+FR-5. Expiration: a payment expires when `expires_at` is set, `now >= expires_at`, and
+the state is `created` or `pending` (the invoice is created, payment is not detected);
+`creating` does not expire (it is advanced by 4.6 to `created` or `failed`); after
+`detected` expiration does not apply. The domain provides the predicate
+`ShouldExpire(state, expiresAt, now)`; the transitions themselves are performed by 4.6
+(before expiring, the task rereads the state under CAS: a payment that became `detected`
+does not expire).
 
-FR-6. `completed_at` фиксируется при переходе в терминальный исход
-(`completed`/`underpaid`/`overpaid`); `fee` остается NULL (трактуется как 0;
-правило комиссии - KI-payment-06).
+FR-6. `completed_at` is set on a transition to a terminal outcome
+(`completed`/`underpaid`/`overpaid`); `fee` remains NULL (treated as 0; the fee rule -
+KI-payment-06).
 
-## 4. Контракты
+## 4. Contracts
 
-Внешние контракты не меняются: решения отражаются состояниями `PaymentState` и
-событиями `payment.events` (4.7).
+External contracts do not change: decisions are reflected by `PaymentState` states and
+`payment.events` events (4.7).
 
-## 5. Модель данных и миграции
+## 5. Data model and migrations
 
-Новых миграций нет: используются поля `received_amount/expected_amount`,
-`confirmations`, `completed_at` (4.1).
+No new migrations: the fields `received_amount/expected_amount`, `confirmations`,
+`completed_at` are used (4.1).
 
-## 6. Конечные автоматы
+## 6. State machines
 
-Целевые состояния политики достижимы по матрице 4.1 кратчайшими цепочками;
-политика не добавляет новых переходов.
+Target states of the policy are reachable via the 4.1 matrix by shortest chains; the
+policy adds no new transitions.
 
 ## 7. Edge cases
 
-Границы ярусов (`expected == below_minor` - следующий ярус); актив без ярусов в
-политике (default); `confirmations == required` (завершение допускается);
-`confirmations < required` при принятой сумме (остаемся `confirming`, self-переход
-с ростом confirmations, в том числе повторно); недоплата ровно на границе
-толеранса (принята, включая неделимые суммы: `floor`-округление границы);
-недоплата на 1 базисный пункт сверх (терминальная); переплата 0 при толерансе 0
-(принята ровно `expected`); `received > expected` сверх толеранса (overpaid
-немедленно); canonical `underpaid`, но сумма в пределах толеранса (политика
-завершает `completed` при пороге); canonical `confirmed` с суммой ниже
-толеранса (политика переводит в `underpaid`); `expires_at` в прошлом у `pending`
-(истекает 4.6); detected перед истечением (истечение не применяется, 4.6
-перечитывает состояние); поздний detected после expired (деньги в сети -
-KI-payment-08); огромный `confirmations` уже отсечен 4.3; bps-математика без float
-и переполнения (проверено на MaxInt64).
+Tier boundaries (`expected == below_minor` - the next tier); an asset without tiers in
+the policy (default); `confirmations == required` (completion is allowed);
+`confirmations < required` with an accepted amount (we stay `confirming`, a
+self-transition with confirmations growth, including repeatedly); an underpayment
+exactly at the tolerance boundary (accepted, including indivisible amounts: the `floor`
+boundary rounding); an underpayment 1 basis point beyond (terminal); an overpayment of 0
+with a tolerance of 0 (exactly `expected` is accepted); `received > expected` beyond the
+tolerance (overpaid immediately); canonical `underpaid` but the amount is within the
+tolerance (the policy completes as `completed` at the threshold); canonical `confirmed`
+with an amount below the tolerance (the policy moves to `underpaid`); `expires_at` in
+the past for `pending` (expires by 4.6); detected before expiration (expiration does not
+apply, 4.6 rereads the state); a late detected after expired (money on-chain -
+KI-payment-08); a huge `confirmations` is already cut off by 4.3; bps math without float
+and overflow (verified on MaxInt64).
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-Решение политики - чистая функция без I/O; конфигурация валидируется при старте
-(включая строгий разбор bps: нечисловое значение - отказ запуска); никаких новых
-обращений к БД на событие (суммы и подтверждения уже в снимке); эффективная
-политика (ярусы, fallback, толерансы) логируется один раз при старте без секретов.
+The policy decision is a pure function without I/O; the configuration is validated at
+startup (including strict bps parsing: a non-numeric value - startup refusal); no new DB
+calls per event (amounts and confirmations are already in the snapshot); the effective
+policy (tiers, fallback, tolerances) is logged once at startup without secrets.
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Unit (домен) | таблица `Decide` (сумма/порог/толерансы, границы и один bp за границей), выбор яруса по активу и сумме, дефолт, валидация конфигурации, `ShouldExpire` по состояниям, bps без float |
-| Unit (usecase) | confirmed ниже порога (self confirming), достижение порога (completed), underpaid сверх толеранса, underpaid в толерансе с порогом и без, overpaid сверх/в толерансе, canonical underpaid при политике completed |
-| Integration | реальный PostgreSQL: confirmed с порогом 1 завершает платеж; повторный confirmed ниже порога остается confirming; подмена сумм на границе |
-| E2E | Kafka + PostgreSQL: detected + confirmed (порог 1) автоматически завершают платеж без ручного перехода; устаревшее событие после completed - no-op |
+| Unit (domain) | the `Decide` table (amount/threshold/tolerances, boundaries and one bp beyond the boundary), tier selection by asset and amount, the default, configuration validation, `ShouldExpire` by states, bps without float |
+| Unit (usecase) | confirmed below the threshold (self confirming), reaching the threshold (completed), underpaid beyond the tolerance, underpaid within the tolerance with and without a threshold, overpaid beyond/within the tolerance, canonical underpaid under a completed policy |
+| Integration | real PostgreSQL: confirmed with threshold 1 completes the payment; a repeated confirmed below the threshold stays confirming; amount substitution at the boundary |
+| E2E | Kafka + PostgreSQL: detected + confirmed (threshold 1) complete the payment automatically without a manual transition; a stale event after completed - no-op |
 | Load | 14.1 |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Тесты вперед (домен, usecase, integration), затем domain/policy.go, правки
-canonical_consumer, конфигурация main. Коммит
-`CBL-4.5: пороги подтверждений, недоплата/переплата и истечение`; спека в том же
-коммите.
+Tests first (domain, usecase, integration), then domain/policy.go, canonical_consumer
+edits, main configuration. Commit
+`CBL-4.5: confirmation thresholds, underpayment/overpayment and expiration`; the spec is
+in the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- Автоматический USD-эквивалент для порогов (price feed из Quote 6.x) -
-  KI-payment-06; до этого ярусы настраиваются оператором в единицах актива и
-  требуют ручного пересмотра при дрейфе курса или пега.
-- Комиссия платформы (`fee` в `payment.events` и проводке леджера) - решение вне
-  4.5 (кандидат: Billing API/тарифы 7.x); сейчас NULL, потребители трактуют как 0
-  (KI-payment-06).
-- Перепроверка `GetGatewayPayment` перед завершением (4.4) станет дополнительным
-  входом `Decide` (точка расширения - `settlementPlan`) после KI-01.
-- Монотонность по `gateway_event_ts` (делегирована из 4.3/T-CONNECTOR-05) не
-  реализована: устаревшее событие из retry-контура может регрессировать
-  `confirmations` или терминализировать платеж после более нового - KI-payment-07.
-- Гонка "expired закоммичен раньше позднего detected": 4.6 перечитывает состояние
-  перед истечением, но обнаруженная после истечения оплата требует ручного
-  разбора/алерта - KI-payment-08 (связано с 3.1/3.2).
-- Сверка Reconciler (9.x) должна учитывать толерансы политики: расхождение
-  классификации шлюза и платформы в пределах толеранса не является
+- An automatic USD equivalent for thresholds (a price feed from Quote 6.x) -
+  KI-payment-06; until then tiers are configured by the operator in asset units and
+  require manual revision when the rate or peg drifts.
+- The platform fee (`fee` in `payment.events` and the ledger posting) - a decision
+  outside 4.5 (candidate: Billing API/tariffs 7.x); currently NULL, consumers treat it
+  as 0 (KI-payment-06).
+- The re-check of `GetGatewayPayment` before completion (4.4) will become an additional
+  input of `Decide` (the extension point - `settlementPlan`) after KI-01.
+- Monotonicity by `gateway_event_ts` (delegated from 4.3/T-CONNECTOR-05) is not
+  implemented: a stale event from the retry loop can regress `confirmations` or
+  terminalize a payment after a newer one - KI-payment-07.
+- The race "expired committed before a late detected": 4.6 rereads the state before
+  expiration, but a payment detected after expiration requires manual review/an alert -
+  KI-payment-08 (related to 3.1/3.2).
+- Reconciler reconciliation (9.x) must account for the policy tolerances: a discrepancy
+  between the gateway and platform classification within the tolerance is not a
   `status_mismatch` (T-PAY-05).
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (15.10.2026). Блокеров нет. MAJOR закрыты:
-атомарность/границы модели доверия (KI-payment-04 расширен до завершения платежа
-из неаутентифицированного топика до 0.5/0.6/4.4), отсутствие лога эффективной
-политики (добавлен `Describe`), неполные сценарии self-перехода и классификации по
-сумме (тесты добавлены), монотонность `gateway_event_ts` и гонка
-expired/detected зафиксированы KI-payment-07/08, влияние на Reconciler - T-PAY-05.
-MINOR границы толеранса (floor-формула FR-2) исправлены и покрыты неделимыми
-суммами; строгий разбор bps; дубликаты ключей и `null` отклоняются; guard
-zero-value политики; `%w` в ошибках конфигурации.
+Four independent passes (15.10.2026). No blockers. MAJORs are closed: atomicity/trust
+model boundaries (KI-payment-04 extended to completing a payment from an unauthenticated
+topic before 0.5/0.6/4.4), the missing effective policy log (`Describe` added),
+incomplete self-transition and amount-classification scenarios (tests added),
+`gateway_event_ts` monotonicity and the expired/detected race recorded in
+KI-payment-07/08, the impact on Reconciler - T-PAY-05. The MINOR of tolerance boundaries
+(the floor formula of FR-2) is fixed and covered by indivisible amounts; strict bps
+parsing; duplicate keys and `null` are rejected; the zero-value policy guard; `%w` in
+configuration errors.
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | MAJOR: лог политики отсутствует; не закрыты self-переход ниже порога и границы сумм; MINOR: формула floor против кода; тихий getenvInt; дубликаты регистра; неполное покрытие ChainTo/кейсов; NIT: %w, дубль теста, WithClock, код возврата | лог добавлен; тесты self/ниже порога/границ; формула `expected - bpsFloor` реализована и протестирована (неделимые суммы); `parseToleranceBPS` с отказом; дубликаты/`Default`/`null`; тесты ChainTo и кейсов; `%w`; дубль убран; WithClock покрыт |
-| Архитектуры | MAJOR: gateway_event_ts не реализован (упало между 4.3 и 4.5); гонка expired/late detected; влияние на Reconciler не зафиксировано; MINOR: decimals в FR-1, граница $1000, ссылки feed, конфликт 4.4/4.5, KI-04 формулировка, case-дубликаты, getenvInt, лог, zero-value, fee NULL, underBPS=10000, дубли состояний ShouldExpire/FindExpired; NIT: ChainTo предупреждение, env-файл | KI-payment-07/08; T-PAY-05 и оговорка для 9.x; FR-1 уточнен (decimals, ключ без регистра); граница яруса задокументирована; ссылки на 6.x/KI-06; точка расширения 4.4 зафиксирована; KI-04 обновлен; валидация дубликатов; строгий bps; лог; guard; fee NULL=0 в FR-6/KI; 10000 bps документирован; дублирование отмечено для 4.6; ChainTo docstring |
-| С контекстом | MAJOR: AGENTS не обновлен (шаг 7); MINOR: тихий bps; лог; округление границы; self-переход без теста; статус спеки; NIT: дубль теста, WithClock, дубли validAsset, регистр ключей, zero-value | AGENTS обновлен в этом коммите; parseToleranceBPS; лог; формула+тесты; тесты; финализация; дубль убран; WithClock тест; дублирование NIT; регистр отклоняется; guard |
-| Безопасности | MAJOR: с 4.5 forged confirmed (сумма в толерансе + confirmations) завершает платеж из неаутентифицированного топика - KI-payment-04 обновлен и требование ACL/mTLS усилено; MINOR: граница недоплаты (+1 unit), `null`/дубликаты/`Default`, тихий bps, лог; NIT: код возврата, zero-value | KI-payment-04 и спека обновлены (границы: до 4.4/0.6 топик вне доверенной сети не публиковать); формула floor; валидация; строгий bps; лог; guard |
+| No context | MAJOR: the policy log is missing; the self-transition below the threshold and the amount boundaries are not covered; MINOR: the floor formula vs the code; silent getenvInt; case duplicates; incomplete ChainTo/case coverage; NIT: %w, a duplicate test, WithClock, the return code | the log added; tests for self/below the threshold/boundaries; the formula `expected - bpsFloor` implemented and tested (indivisible amounts); `parseToleranceBPS` with refusal; duplicates/`Default`/`null`; ChainTo and case tests; `%w`; the duplicate removed; WithClock covered |
+| Architecture | MAJOR: gateway_event_ts not implemented (it fell between 4.3 and 4.5); the expired/late detected race; the impact on Reconciler not recorded; MINOR: decimals in FR-1, the $1000 boundary, feed references, the 4.4/4.5 conflict, the KI-04 wording, case duplicates, getenvInt, the log, zero-value, fee NULL, underBPS=10000, duplicate ShouldExpire/FindExpired states; NIT: the ChainTo warning, the env file | KI-payment-07/08; T-PAY-05 and a caveat for 9.x; FR-1 clarified (decimals, a case-insensitive key); the tier boundary documented; references to 6.x/KI-06; the 4.4 extension point recorded; KI-04 updated; duplicate validation; strict bps; the log; the guard; fee NULL=0 in FR-6/KI; 10000 bps documented; the duplication noted for 4.6; the ChainTo docstring |
+| With context | MAJOR: AGENTS not updated (step 7); MINOR: silent bps; the log; boundary rounding; the self-transition without a test; the spec status; NIT: a duplicate test, WithClock, duplicate validAsset, key case, zero-value | AGENTS updated in this commit; parseToleranceBPS; the log; the formula+tests; tests; finalization; the duplicate removed; a WithClock test; the NIT duplication; case is rejected; the guard |
+| Security | MAJOR: since 4.5 a forged confirmed (an amount within the tolerance + confirmations) completes a payment from an unauthenticated topic - KI-payment-04 updated and the ACL/mTLS requirement tightened; MINOR: the underpayment boundary (+1 unit), `null`/duplicates/`Default`, silent bps, the log; NIT: the return code, zero-value | KI-payment-04 and the spec updated (boundaries: until 4.4/0.6 do not publish the topic outside the trusted network); the floor formula; validation; strict bps; the log; the guard |

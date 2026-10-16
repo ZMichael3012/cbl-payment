@@ -36,8 +36,8 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// setupPaymentServer поднимает тестовый PaymentService на bufconn поверх
-// реального PostgreSQL (testcontainers).
+// setupPaymentServer starts a test PaymentService on bufconn over a real
+// PostgreSQL (testcontainers).
 func setupPaymentServer(t *testing.T) (paymentv1.PaymentServiceClient, *gorm.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -81,8 +81,9 @@ func setupPaymentServer(t *testing.T) (paymentv1.PaymentServiceClient, *gorm.DB)
 	return paymentv1.NewPaymentServiceClient(conn), db
 }
 
-// seedGrpcPayment создает платеж через автомат (журнал создания пишется) и
-// фиксирует котировку переходом creating -> created.
+// seedGrpcPayment creates a payment through the state machine (the creation
+// journal is written) and locks the quote with the creating -> created
+// transition.
 func seedGrpcPayment(t *testing.T, db *gorm.DB, merchantID, key string, rate string, lockedUntil time.Time) storage.Payment {
 	t.Helper()
 	ctx := context.Background()
@@ -115,7 +116,7 @@ func seedGrpcPayment(t *testing.T, db *gorm.DB, merchantID, key string, rate str
 	return updated
 }
 
-// strPtr возвращает указатель на строку для патчей переходов.
+// strPtr returns a pointer to the string for transition patches.
 func strPtr(value string) *string { return &value }
 
 func TestIntegrationGrpcGetPayment(t *testing.T) {
@@ -142,12 +143,13 @@ func TestIntegrationGrpcGetPayment(t *testing.T) {
 	assert.Equal(t, uint32(2), payment.GetExpectedAmount().GetDecimals())
 	assert.Equal(t, "TJRabPrwbZy45sbavfcjinPJC18kjpRTv8", payment.GetPayAddress())
 	assert.Equal(t, uint64(2), payment.GetStateVersion())
-	require.Len(t, payment.GetTimeline(), 2, "создание и фиксация котировки")
+	require.Len(t, payment.GetTimeline(), 2, "creation and quote locking")
 	assert.Equal(t, paymentv1.PaymentState_PAYMENT_STATE_CREATING, payment.GetTimeline()[0].GetState())
 	assert.Equal(t, paymentv1.PaymentState_PAYMENT_STATE_CREATED, payment.GetTimeline()[1].GetState())
-	assert.Equal(t, "quote fixed", payment.GetTimeline()[1].GetComment(), "comment - причина перехода")
+	assert.Equal(t, "quote fixed", payment.GetTimeline()[1].GetComment(), "comment is the transition reason")
 
-	// Данные сети приходят из переходов consumer-а (txid, confirmations, сумма).
+	// Network data comes from the consumer transitions (txid, confirmations,
+	// amount).
 	repo := storage.NewRepository(db)
 	_, err = repo.Transition(ctx, seed.ID, 2, domain.StatePending, storage.TransitionPatch{})
 	require.NoError(t, err)
@@ -178,8 +180,9 @@ func TestIntegrationGrpcGetPayment(t *testing.T) {
 	require.Equal(t, codes.NotFound, status.Code(err))
 }
 
-// TestIntegrationGrpcGetPaymentWithoutQuote проверяет nil-пути маппинга:
-// создание, не дошедшее до фиксации котировки, отдается без rate/locked_until.
+// TestIntegrationGrpcGetPaymentWithoutQuote checks the nil mapping paths:
+// a creation that has not reached quote locking is returned without
+// rate/locked_until.
 func TestIntegrationGrpcGetPaymentWithoutQuote(t *testing.T) {
 	client, db := setupPaymentServer(t)
 	ctx := context.Background()
@@ -207,14 +210,15 @@ func TestIntegrationGrpcGetPaymentWithoutQuote(t *testing.T) {
 	assert.Empty(t, payment.GetTxid())
 	assert.Zero(t, payment.GetConfirmations())
 	assert.Nil(t, payment.GetReceivedAmount())
-	require.Len(t, payment.GetTimeline(), 1, "только создание")
+	require.Len(t, payment.GetTimeline(), 1, "creation only")
 }
 
 func TestIntegrationGrpcListPayments(t *testing.T) {
 	client, db := setupPaymentServer(t)
 	ctx := context.Background()
 
-	// Разносим создания по времени, чтобы период и порядок были детерминированы.
+	// Spread the creations in time so that the period and order are
+	// deterministic.
 	first := seedGrpcPayment(t, db, "m-list", "grpc-list-0", "1.1", time.Now().UTC().Add(10*time.Minute))
 	time.Sleep(10 * time.Millisecond)
 	second := seedGrpcPayment(t, db, "m-list", "grpc-list-1", "2.2", time.Now().UTC().Add(20*time.Minute))
@@ -228,10 +232,10 @@ func TestIntegrationGrpcListPayments(t *testing.T) {
 		CreatedFrom: timestamppb.New(from),
 	})
 	require.NoError(t, err)
-	require.Len(t, page.GetPayments(), 2, "мерчантский фильтр и период from включительно")
-	assert.Equal(t, third.ID, page.GetPayments()[0].GetPaymentId(), "порядок created_at DESC")
+	require.Len(t, page.GetPayments(), 2, "merchant filter and period from inclusive")
+	assert.Equal(t, third.ID, page.GetPayments()[0].GetPaymentId(), "created_at DESC order")
 	assert.Equal(t, second.ID, page.GetPayments()[1].GetPaymentId())
-	assert.Empty(t, page.GetPayments()[0].GetTimeline(), "список не несет timeline")
+	assert.Empty(t, page.GetPayments()[0].GetTimeline(), "the list carries no timeline")
 
 	paged, err := client.ListPayments(ctx, &paymentv1.ListPaymentsRequest{
 		MerchantId:  "m-list",
@@ -258,7 +262,7 @@ func TestIntegrationGrpcListPayments(t *testing.T) {
 		CreatedTo:  timestamppb.New(third.CreatedAt),
 	})
 	require.NoError(t, err)
-	require.Len(t, toPage.GetPayments(), 2, "to исключительно: третий платеж не входит")
+	require.Len(t, toPage.GetPayments(), 2, "to exclusive: the third payment is not included")
 	assert.Equal(t, second.ID, toPage.GetPayments()[0].GetPaymentId())
 
 	empty, err := client.ListPayments(ctx, &paymentv1.ListPaymentsRequest{
@@ -266,7 +270,7 @@ func TestIntegrationGrpcListPayments(t *testing.T) {
 		CreatedTo:  timestamppb.New(first.CreatedAt),
 	})
 	require.NoError(t, err)
-	assert.Empty(t, empty.GetPayments(), "запись ровно на границе to не входит")
+	assert.Empty(t, empty.GetPayments(), "an entry exactly on the to boundary is not included")
 
 	statePage, err := client.ListPayments(ctx, &paymentv1.ListPaymentsRequest{
 		MerchantId:  "m-list",
@@ -277,7 +281,7 @@ func TestIntegrationGrpcListPayments(t *testing.T) {
 
 	unknown, err := client.ListPayments(ctx, &paymentv1.ListPaymentsRequest{MerchantId: "m-none"})
 	require.NoError(t, err)
-	assert.Empty(t, unknown.GetPayments(), "неизвестный мерчант - пустой список, не 404")
+	assert.Empty(t, unknown.GetPayments(), "an unknown merchant gives an empty list, not a 404")
 
 	_, err = client.ListPayments(ctx, &paymentv1.ListPaymentsRequest{MerchantId: "m-list", Cursor: "junk"})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))

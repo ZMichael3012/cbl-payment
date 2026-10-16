@@ -67,7 +67,7 @@ func TestListPaymentsValidation(t *testing.T) {
 		MerchantId:  "m-1",
 		CreatedFrom: &timestamppb.Timestamp{Seconds: 253402300800},
 	})
-	require.Error(t, err, "метка за пределами диапазона protobuf")
+	require.Error(t, err, "a timestamp outside the protobuf range")
 	assert.Equal(t, grpcmw.KindInvalidArgument, grpcmw.KindOf(err))
 
 	_, err = server.ListPayments(ctx, &paymentv1.ListPaymentsRequest{
@@ -83,7 +83,7 @@ func TestListPaymentsValidation(t *testing.T) {
 		CreatedFrom: timestamppb.New(time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)),
 		CreatedTo:   timestamppb.New(time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)),
 	})
-	require.Error(t, err, "пустой период отклоняется")
+	require.Error(t, err, "an empty period is rejected")
 	assert.Equal(t, grpcmw.KindInvalidArgument, grpcmw.KindOf(err))
 }
 
@@ -106,7 +106,7 @@ func TestStateMappingRoundTrip(t *testing.T) {
 
 	filter, err := stateFilter(paymentv1.PaymentState_PAYMENT_STATE_UNSPECIFIED)
 	require.NoError(t, err)
-	assert.Nil(t, filter, "UNSPECIFIED - отсутствие фильтра")
+	assert.Nil(t, filter, "UNSPECIFIED means no filter")
 
 	filter, err = stateFilter(paymentv1.PaymentState_PAYMENT_STATE_COMPLETED)
 	require.NoError(t, err)

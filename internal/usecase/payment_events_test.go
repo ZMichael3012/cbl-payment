@@ -18,7 +18,7 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// paymentTransitionEvent собирает переход с заполненным платежом.
+// paymentTransitionEvent assembles a transition with a populated payment.
 func paymentTransitionEvent(to domain.State) storage.TransitionEvent {
 	received := int64(99_500)
 	receivedAsset := "USDT"
@@ -109,7 +109,7 @@ func TestBuildPaymentEventEnvelopeSkipsStatesWithoutType(t *testing.T) {
 			t.Parallel()
 			envelope, emit, err := usecase.BuildPaymentEventEnvelope(paymentTransitionEvent(state))
 			require.NoError(t, err)
-			assert.False(t, emit, "состояние без типа CF-2 событий не пишет")
+			assert.False(t, emit, "a state without a CF-2 type does not emit an event")
 			assert.Equal(t, outbox.Envelope{}, envelope)
 		})
 	}
@@ -122,7 +122,7 @@ func TestBuildPaymentEventEnvelopeSelfTransition(t *testing.T) {
 	event.From = domain.StateConfirming
 	envelope, emit, err := usecase.BuildPaymentEventEnvelope(event)
 	require.NoError(t, err)
-	require.True(t, emit, "самопереход фиксирует новую версию состояния")
+	require.True(t, emit, "a self-transition records a new state version")
 
 	var payload eventsv1.PaymentEvent
 	require.NoError(t, proto.Unmarshal(envelope.Payload, &payload))
@@ -146,8 +146,8 @@ func TestBuildPaymentEventEnvelopeOptionalMoney(t *testing.T) {
 
 	var payload eventsv1.PaymentEvent
 	require.NoError(t, proto.Unmarshal(envelope.Payload, &payload))
-	assert.Nil(t, payload.GetReceivedAmount(), "полученная сумма не задана - поле опущено")
-	assert.Nil(t, payload.GetFee(), "неполная тройка fee денег не образует")
+	assert.Nil(t, payload.GetReceivedAmount(), "the received amount is not set - the field is omitted")
+	assert.Nil(t, payload.GetFee(), "an incomplete fee triple does not form money")
 	assert.Empty(t, payload.GetQuoteId())
 	assert.Empty(t, payload.GetTxid())
 }
@@ -184,8 +184,8 @@ func TestBuildPaymentEventEnvelopeDecimalsBoundaries(t *testing.T) {
 
 		var payload eventsv1.PaymentEvent
 		require.NoError(t, proto.Unmarshal(envelope.Payload, &payload))
-		assert.Equal(t, uint32(decimals), payload.GetExpectedAmount().GetDecimals()) //nolint:gosec // граница 0 - 18 проверена в цикле
-		assert.Equal(t, uint32(decimals), payload.GetReceivedAmount().GetDecimals()) //nolint:gosec // граница 0 - 18 проверена в цикле
+		assert.Equal(t, uint32(decimals), payload.GetExpectedAmount().GetDecimals()) //nolint:gosec // the 0 to 18 boundary is checked in the loop
+		assert.Equal(t, uint32(decimals), payload.GetReceivedAmount().GetDecimals()) //nolint:gosec // the 0 to 18 boundary is checked in the loop
 	}
 }
 

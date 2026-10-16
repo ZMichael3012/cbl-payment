@@ -42,7 +42,7 @@ func TestIntegrationQuoteFieldsRoundTrip(t *testing.T) {
 	require.NotNil(t, loaded.QuoteID)
 	assert.Equal(t, quoteID, *loaded.QuoteID)
 	require.NotNil(t, loaded.QuoteLockedUntil)
-	assert.True(t, loaded.QuoteLockedUntil.Equal(lockedUntil), "locked_until переживает round-trip")
+	assert.True(t, loaded.QuoteLockedUntil.Equal(lockedUntil), "locked_until survives the round-trip")
 	require.Len(t, history, 2)
 }
 
@@ -63,7 +63,7 @@ func TestIntegrationQuoteFieldsImmutableAfterFill(t *testing.T) {
 		QuoteLockedUntil: &lockedUntil,
 	})
 
-	// После заполнения поля котировки неизменяемы (fill-once, 4.8).
+	// Once filled, the quote fields are immutable (fill-once, 4.8).
 	otherRate := "1.6"
 	_, err := repo.Transition(ctx, payment.ID, 2, domain.StateCreated, storage.TransitionPatch{Rate: &otherRate})
 	require.Error(t, err)
@@ -74,8 +74,8 @@ func TestIntegrationQuoteFieldsImmutableAfterFill(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "immutable fields cannot change")
 
-	// Незаполненное поле котировки заполняется позже (создание 4.2 может дойти
-	// до created без locked_until).
+	// An unfilled quote field is filled later (a 4.2 creation may reach
+	// created without locked_until).
 	second := newPayment(t, "quote-3")
 	require.NoError(t, repo.Create(ctx, second))
 	transition(t, repo, second.ID, 1, domain.StateCreated, storage.TransitionPatch{PayAddress: strPtr("Taddr")})
@@ -98,7 +98,7 @@ func TestIntegrationListPaymentsPeriodAndCursor(t *testing.T) {
 		payment.State = string(domain.StateCreating)
 		payment.StateVersion = 1
 		payment.CreatedAt = base.Add(time.Duration(i) * time.Hour)
-		require.NoError(t, db.Create(&payment).Error, "прямая вставка: created_at неизменяем")
+		require.NoError(t, db.Create(&payment).Error, "direct insert: created_at is immutable")
 		ids[i] = payment.ID
 	}
 	other := newPayment(t, "period-other")
@@ -112,9 +112,9 @@ func TestIntegrationListPaymentsPeriodAndCursor(t *testing.T) {
 	to := base.Add(2*time.Hour + 30*time.Minute)
 	page, cursor, err := repo.List(ctx, storage.ListFilter{MerchantID: "m-period", CreatedFrom: &from, CreatedTo: &to})
 	require.NoError(t, err)
-	require.Len(t, page, 2, "границы периода: from включительно, to исключительно")
+	require.Len(t, page, 2, "period bounds: from inclusive, to exclusive")
 	assert.Empty(t, cursor)
-	assert.Equal(t, ids[2], page[0].ID, "порядок created_at DESC")
+	assert.Equal(t, ids[2], page[0].ID, "created_at DESC order")
 	assert.Equal(t, ids[1], page[1].ID)
 
 	page, cursor, err = repo.List(ctx, storage.ListFilter{MerchantID: "m-period", CreatedFrom: &from, CreatedTo: &to, Limit: 1})
@@ -124,7 +124,7 @@ func TestIntegrationListPaymentsPeriodAndCursor(t *testing.T) {
 	page, cursor, err = repo.List(ctx, storage.ListFilter{MerchantID: "m-period", CreatedFrom: &from, CreatedTo: &to, Limit: 1, Cursor: cursor})
 	require.NoError(t, err)
 	require.Len(t, page, 1)
-	assert.Equal(t, ids[1], page[0].ID, "страницы не пересекаются")
+	assert.Equal(t, ids[1], page[0].ID, "the pages do not overlap")
 	assert.Empty(t, cursor)
 
 	atFrom := base
@@ -135,29 +135,30 @@ func TestIntegrationListPaymentsPeriodAndCursor(t *testing.T) {
 	atTo := base
 	page, _, err = repo.List(ctx, storage.ListFilter{MerchantID: "m-period", CreatedTo: &atTo})
 	require.NoError(t, err)
-	assert.Empty(t, page, "запись ровно на границе to не входит")
+	assert.Empty(t, page, "an entry exactly on the to boundary is not included")
 
 	all, _, err := repo.List(ctx, storage.ListFilter{MerchantID: "m-period"})
 	require.NoError(t, err)
-	require.Len(t, all, 3, "чужие мерчанты не попадают в список")
+	require.Len(t, all, 3, "other merchants are not included in the list")
 	for _, listed := range all {
 		assert.Equal(t, "m-period", listed.MerchantID)
 	}
 
-	// Курсор из другой выборки принимается: фильтр строится по (created_at, id).
+	// A cursor from another query is accepted: the filter is built on
+	// (created_at, id).
 	firstPage, crossCursor, err := repo.List(ctx, storage.ListFilter{MerchantID: "m-period", Limit: 1})
 	require.NoError(t, err)
 	require.Len(t, firstPage, 1)
 	require.NotEmpty(t, crossCursor)
 	_, _, err = repo.List(ctx, storage.ListFilter{MerchantID: "m-other", Cursor: crossCursor})
-	require.NoError(t, err, "курсор чужой выборки не отклоняется")
+	require.NoError(t, err, "a cursor from another query is not rejected")
 
 	_, _, err = repo.List(ctx, storage.ListFilter{MerchantID: "m-period", Cursor: "junk"})
 	require.ErrorIs(t, err, storage.ErrInvalidCursor)
 }
 
-// TestIntegrationGetTimelineLimited проверяет серверный предел истории: Get
-// отдает последние 500 переходов (защита от неограниченного ответа).
+// TestIntegrationGetTimelineLimited checks the server history limit: Get
+// returns the last 500 transitions (protection against an unbounded response).
 func TestIntegrationGetTimelineLimited(t *testing.T) {
 	db := setupPaymentDB(t)
 	repo := storage.NewRepository(db)
@@ -179,12 +180,12 @@ func TestIntegrationGetTimelineLimited(t *testing.T) {
 
 	_, history, err := repo.Get(ctx, payment.ID)
 	require.NoError(t, err)
-	require.Len(t, history, 500, "история ограничена последними 500 переходами")
-	assert.Equal(t, int64(11), history[0].StateVersion, "отдаются последние записи журнала")
-	assert.Equal(t, int64(510), history[len(history)-1].StateVersion, "порядок по возрастанию версии")
+	require.Len(t, history, 500, "the history is limited to the last 500 transitions")
+	assert.Equal(t, int64(11), history[0].StateVersion, "the latest journal entries are returned")
+	assert.Equal(t, int64(510), history[len(history)-1].StateVersion, "ascending version order")
 }
 
-// TestIntegrationListPaymentsLimitClamp проверяет клампинг размера страницы.
+// TestIntegrationListPaymentsLimitClamp checks the page size clamping.
 func TestIntegrationListPaymentsLimitClamp(t *testing.T) {
 	db := setupPaymentDB(t)
 	repo := storage.NewRepository(db)
@@ -200,9 +201,9 @@ func TestIntegrationListPaymentsLimitClamp(t *testing.T) {
 
 	page, cursor, err := repo.List(ctx, storage.ListFilter{MerchantID: "m-clamp", Limit: 5000})
 	require.NoError(t, err)
-	require.Len(t, page, 200, "limit клампится потолком 200")
-	assert.NotEmpty(t, cursor, "за страницей есть продолжение")
+	require.Len(t, page, 200, "limit is clamped by the 200 ceiling")
+	assert.NotEmpty(t, cursor, "there is a continuation after the page")
 }
 
-// strPtr возвращает указатель на строку для патчей переходов.
+// strPtr returns a pointer to the string for transition patches.
 func strPtr(value string) *string { return &value }

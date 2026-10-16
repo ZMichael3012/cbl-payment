@@ -1,3 +1,3 @@
-// Пакет transport содержит транспортный слой сервиса payment:
-// HTTP-хендлеры Gin и gRPC-обработчики, собранные из usecase.
+// Package transport contains the transport layer of the payment service:
+// Gin HTTP handlers and gRPC handlers assembled from the usecase package.
 package transport

@@ -15,10 +15,10 @@ import (
 	"github.com/cbl/cbl-payment/internal/usecase"
 )
 
-// janitorFixedNow задает фиксированные часы юнит-тестов janitor-а.
+// janitorFixedNow defines the fixed clock of the janitor unit tests.
 var janitorFixedNow = time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 
-// janitorTransition описывает зафиксированный переход фейкового хранилища.
+// janitorTransition describes a recorded transition of the fake store.
 type janitorTransition struct {
 	id              string
 	expectedVersion uint64
@@ -26,14 +26,14 @@ type janitorTransition struct {
 	reason          string
 }
 
-// janitorFindCall описывает аргументы выборки фейкового хранилища.
+// janitorFindCall describes the selection arguments of the fake store.
 type janitorFindCall struct {
 	section string
 	cutoff  time.Time
 	limit   int
 }
 
-// fakeJanitorStore подменяет выборки и переходы janitor-а.
+// fakeJanitorStore substitutes the janitor selections and transitions.
 type fakeJanitorStore struct {
 	expired       []storage.Payment
 	creating      []storage.Payment
@@ -44,7 +44,7 @@ type fakeJanitorStore struct {
 	findCalls     []janitorFindCall
 }
 
-// FindExpired возвращает подготовленные счета с истекшим сроком.
+// FindExpired returns the prepared expired invoices.
 func (f *fakeJanitorStore) FindExpired(_ context.Context, before time.Time, limit int) ([]storage.Payment, error) {
 	f.findCalls = append(f.findCalls, janitorFindCall{section: "expired", cutoff: before, limit: limit})
 	if err := f.findErr["expired"]; err != nil {
@@ -53,7 +53,7 @@ func (f *fakeJanitorStore) FindExpired(_ context.Context, before time.Time, limi
 	return f.expired, nil
 }
 
-// FindCreating возвращает подготовленные зависшие создания.
+// FindCreating returns the prepared stuck creations.
 func (f *fakeJanitorStore) FindCreating(_ context.Context, olderThan time.Time, limit int) ([]storage.Payment, error) {
 	f.findCalls = append(f.findCalls, janitorFindCall{section: "creating", cutoff: olderThan, limit: limit})
 	if err := f.findErr["creating"]; err != nil {
@@ -62,7 +62,7 @@ func (f *fakeJanitorStore) FindCreating(_ context.Context, olderThan time.Time, 
 	return f.creating, nil
 }
 
-// FindStuck возвращает подготовленные зависшие платежи.
+// FindStuck returns the prepared stuck payments.
 func (f *fakeJanitorStore) FindStuck(_ context.Context, olderThan time.Time, limit int) ([]storage.Payment, error) {
 	f.findCalls = append(f.findCalls, janitorFindCall{section: "stuck", cutoff: olderThan, limit: limit})
 	if err := f.findErr["stuck"]; err != nil {
@@ -71,7 +71,7 @@ func (f *fakeJanitorStore) FindStuck(_ context.Context, olderThan time.Time, lim
 	return f.stuck, nil
 }
 
-// Transition фиксирует переход или возвращает заданную ошибку.
+// Transition records the transition or returns the configured error.
 func (f *fakeJanitorStore) Transition(_ context.Context, id string, expectedVersion uint64, to domain.State, patch storage.TransitionPatch) (storage.Payment, error) {
 	if err := f.transitionErr[id]; err != nil {
 		return storage.Payment{}, err
@@ -82,10 +82,10 @@ func (f *fakeJanitorStore) Transition(_ context.Context, id string, expectedVers
 		to:              to,
 		reason:          patch.Reason,
 	})
-	return storage.Payment{ID: id, State: string(to), StateVersion: int64(expectedVersion) + 1}, nil //nolint:gosec // версии в тесте малы
+	return storage.Payment{ID: id, State: string(to), StateVersion: int64(expectedVersion) + 1}, nil //nolint:gosec // versions in the test are small
 }
 
-// newJanitor собирает janitor с фиксированными часами.
+// newJanitor assembles a janitor with a fixed clock.
 func newJanitor(t *testing.T, store usecase.JanitorStore) *usecase.Janitor {
 	t.Helper()
 	janitor, err := usecase.NewJanitor(store, zap.NewNop(), usecase.JanitorConfig{
@@ -95,7 +95,7 @@ func newJanitor(t *testing.T, store usecase.JanitorStore) *usecase.Janitor {
 	return janitor
 }
 
-// duePayment собирает платеж в заданном состоянии с указанным сроком.
+// duePayment assembles a payment in the given state with the given deadline.
 func duePayment(id string, state domain.State, expiresAt *time.Time) storage.Payment {
 	return storage.Payment{
 		ID:             id,
@@ -124,7 +124,7 @@ func TestJanitorConfigValidation(t *testing.T) {
 	require.ErrorIs(t, err, usecase.ErrInvalidJanitorConfig)
 
 	_, err = usecase.NewJanitor(store, nil, usecase.JanitorConfig{})
-	require.NoError(t, err, "нулевая конфигурация - значения по умолчанию")
+	require.NoError(t, err, "zero configuration - default values")
 }
 
 func TestJanitorSweepExpiresDuePayments(t *testing.T) {
@@ -165,17 +165,17 @@ func TestJanitorSweepSkipsSnapshotNotDue(t *testing.T) {
 
 	assert.Zero(t, result.Expired)
 	assert.Zero(t, result.Errors)
-	assert.Empty(t, store.transitions, "двойная проверка ShouldExpire отсекает снимок")
+	assert.Empty(t, store.transitions, "the double ShouldExpire check filters the snapshot")
 }
 
 func TestJanitorSweepBoundaryEquality(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeJanitorStore{
-		// expires_at ровно now - счет считается истекшим.
+		// expires_at exactly now - the invoice is considered expired.
 		expired: []storage.Payment{duePayment("p-eq", domain.StatePending, &janitorFixedNow)},
 		creating: []storage.Payment{
-			// created_at ровно на границе таймаута (5m) - считается зависшим.
+			// created_at exactly at the timeout boundary (5m) - considered stuck.
 			{ID: "p-bound", State: string(domain.StateCreating), StateVersion: 1,
 				CreatedAt: janitorFixedNow.Add(-5 * time.Minute)},
 		},
@@ -213,7 +213,7 @@ func TestJanitorSweepExpireConflictSkipped(t *testing.T) {
 
 	assert.Equal(t, 1, result.Expired)
 	assert.Equal(t, 1, result.Conflicts)
-	assert.Zero(t, result.Errors, "конфликт версии - не ошибка прохода")
+	assert.Zero(t, result.Errors, "a version conflict is not a sweep error")
 	require.Len(t, store.transitions, 1)
 	assert.Equal(t, "p-ok", store.transitions[0].id)
 }
@@ -235,7 +235,7 @@ func TestJanitorSweepTransitionErrorContinues(t *testing.T) {
 	assert.Equal(t, 1, result.Expired)
 	assert.Equal(t, 1, result.Errors)
 	require.Len(t, store.transitions, 1)
-	assert.Equal(t, "p-ok", store.transitions[0].id, "проход продолжается после ошибки платежа")
+	assert.Equal(t, "p-ok", store.transitions[0].id, "the sweep continues after a payment error")
 }
 
 func TestJanitorSweepFailsStuckCreating(t *testing.T) {
@@ -252,7 +252,7 @@ func TestJanitorSweepFailsStuckCreating(t *testing.T) {
 	assert.Equal(t, 1, result.CreatingFailed)
 	assert.Zero(t, result.Errors)
 	require.Len(t, store.transitions, 1)
-	assert.Equal(t, "p-stuck", store.transitions[0].id, "свежее создание не закрывается")
+	assert.Equal(t, "p-stuck", store.transitions[0].id, "a fresh creation is not closed")
 	assert.Equal(t, domain.StateFailed, store.transitions[0].to)
 	assert.Equal(t, "janitor creating timeout", store.transitions[0].reason)
 }
@@ -270,7 +270,7 @@ func TestJanitorSweepReportsStuckWithoutTransitions(t *testing.T) {
 
 	assert.Equal(t, 2, result.Stuck)
 	assert.Zero(t, result.Errors)
-	assert.Empty(t, store.transitions, "денежные состояния не терминализируются автоматически")
+	assert.Empty(t, store.transitions, "money states are not terminalized automatically")
 }
 
 func TestJanitorSweepFindErrorSkipsSection(t *testing.T) {
@@ -282,9 +282,9 @@ func TestJanitorSweepFindErrorSkipsSection(t *testing.T) {
 	}
 	result := newJanitor(t, store).Sweep(context.Background())
 
-	assert.Equal(t, 1, result.Errors, "ошибка выборки учтена")
+	assert.Equal(t, 1, result.Errors, "the selection error is counted")
 	assert.Zero(t, result.Expired)
-	assert.Equal(t, 1, result.CreatingFailed, "следующие секции прохода выполняются")
+	assert.Equal(t, 1, result.CreatingFailed, "the next sweep sections still run")
 }
 
 func TestJanitorSweepCancelledContext(t *testing.T) {
@@ -316,9 +316,9 @@ func TestJanitorRunStopsOnContextCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("janitor не остановился по отмене контекста")
+		t.Fatal("janitor did not stop on context cancellation")
 	}
 }
 
-// ptrTime возвращает указатель на время.
+// ptrTime returns a pointer to the time.
 func ptrTime(value time.Time) *time.Time { return &value }
