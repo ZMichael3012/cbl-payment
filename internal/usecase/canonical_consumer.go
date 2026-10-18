@@ -162,13 +162,14 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 			if handled {
 				return nil
 			}
-			// Money on the network after invoice expiry needs manual review
-			// (KI-payment-08): the event arrived late in processing order, but
-			// the payment cannot simply be dropped - a separate message for
-			// log-based alerts (metrics - 0.7).
-			if current == domain.StateExpired &&
+			// Money on the network after invoice expiry or merchant
+			// cancellation needs manual review (KI-payment-08, KI-payment-09):
+			// the event arrived late in processing order, but the payment
+			// cannot simply be dropped - a separate message for log-based
+			// alerts (metrics - 0.7).
+			if (current == domain.StateExpired || current == domain.StateCancelled) &&
 				(eventType == domain.CanonicalDetected || eventType == domain.CanonicalConfirmed) {
-				c.log.Warn("late canonical event after expiry needs manual review",
+				c.log.Warn("late canonical event after terminal state needs manual review",
 					zap.String("payment_id", payment.ID),
 					zap.String("type", string(eventType)),
 					zap.String("state", string(current)),

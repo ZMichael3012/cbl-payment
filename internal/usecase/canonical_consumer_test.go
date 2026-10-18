@@ -491,7 +491,22 @@ func TestCanonicalConsumerLateDetectedAfterExpiryAlerts(t *testing.T) {
 	assert.Empty(t, store.transitions)
 
 	require.Len(t, logs.All(), 1, "a late payment after expiry triggers a separate alert (KI-payment-08)")
-	assert.Equal(t, "late canonical event after expiry needs manual review", logs.All()[0].Message)
+	assert.Equal(t, "late canonical event after terminal state needs manual review", logs.All()[0].Message)
+}
+
+func TestCanonicalConsumerLateDetectedAfterCancellationAlerts(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore(domain.StateCancelled, 5)
+	core, logs := observer.New(zap.WarnLevel)
+	consumer := usecase.NewCanonicalConsumer(store, zap.New(core))
+
+	require.NoError(t, consumer.Handle(context.Background(), nil, canonicalMessage(t, detectedEvent())))
+	assert.Equal(t, string(domain.StateCancelled), store.payment.State)
+	assert.Empty(t, store.transitions)
+
+	require.Len(t, logs.All(), 1, "a deposit after a cancellation needs manual review (KI-payment-09)")
+	assert.Equal(t, "late canonical event after terminal state needs manual review", logs.All()[0].Message)
 }
 
 func TestCanonicalConsumerPolicyWaitsBelowThreshold(t *testing.T) {

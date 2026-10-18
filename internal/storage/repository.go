@@ -159,6 +159,13 @@ type TransitionPatch struct {
 	Rate *string
 	// QuoteLockedUntil holds the quote lock deadline (fill-once, 4.8).
 	QuoteLockedUntil *time.Time
+	// ExpectedAmount holds the locked pay amount in minor units (filled once
+	// by the creating -> created transition, 4.2).
+	ExpectedAmount *int64
+	// ExpectedAsset holds the locked pay asset (4.2).
+	ExpectedAsset *string
+	// ExpectedDecimals holds the locked pay asset scale (4.2).
+	ExpectedDecimals *int
 	// PayAddress holds the payment address.
 	PayAddress *string
 	// GatewayID holds the payment identifier at the gateway.
@@ -471,6 +478,22 @@ func (r *Repository) Payment(ctx context.Context, id string) (Payment, error) {
 	return r.PaymentTx(ctx, nil, id)
 }
 
+// ByIdempotencyKey returns the payment of the (merchant, key) pair; the unique
+// index guarantees at most one row. ErrNotFound when the key is unused (4.2).
+func (r *Repository) ByIdempotencyKey(ctx context.Context, merchantID, key string) (Payment, error) {
+	var payment Payment
+	err := r.db.WithContext(ctx).
+		Where("merchant_id = ? AND idempotency_key = ?", merchantID, key).
+		Take(&payment).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Payment{}, fmt.Errorf("%w: merchant %s key %s", ErrNotFound, merchantID, key)
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("storage: read payment by idempotency key: %w", err)
+	}
+	return payment, nil
+}
+
 // PaymentTx returns the payment without the history within the given transaction
 // (tx=nil means its own): the consumer reads the state in the Guard transaction.
 func (r *Repository) PaymentTx(ctx context.Context, tx *gorm.DB, id string) (Payment, error) {
@@ -614,6 +637,15 @@ func (p TransitionPatch) updates() map[string]any {
 	}
 	if p.QuoteLockedUntil != nil {
 		updates["quote_locked_until"] = *p.QuoteLockedUntil
+	}
+	if p.ExpectedAmount != nil {
+		updates["expected_amount"] = *p.ExpectedAmount
+	}
+	if p.ExpectedAsset != nil {
+		updates["expected_asset"] = *p.ExpectedAsset
+	}
+	if p.ExpectedDecimals != nil {
+		updates["expected_decimals"] = *p.ExpectedDecimals
 	}
 	if p.PayAddress != nil {
 		updates["pay_address"] = *p.PayAddress

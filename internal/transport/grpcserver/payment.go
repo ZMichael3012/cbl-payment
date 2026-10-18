@@ -15,6 +15,7 @@ import (
 	paymentv1 "github.com/cbl/cbl-protos/gen/go/billing/payment/v1"
 
 	"github.com/cbl/cbl-kit/grpcmw"
+	kitmoney "github.com/cbl/cbl-kit/money"
 
 	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"
@@ -25,19 +26,121 @@ import (
 const (
 	maxMerchantIDLen = 256
 	maxCursorLen     = 256
+	// maxIdempotencyKeyLen bounds the creation and cancel keys (4.2).
+	maxIdempotencyKeyLen = 255
 )
 
-// Payment implements the PaymentService gRPC service. CreatePayment and
-// CancelPayment will appear in 4.2 (blocked by KI-01, the gateway); the reads
-// are implemented in 4.8.
+// Payment implements the PaymentService gRPC service: reads (4.8) and the
+// creation flow (4.2).
 type Payment struct {
 	paymentv1.UnimplementedPaymentServiceServer
-	query *usecase.PaymentQuery
+	query    *usecase.PaymentQuery
+	creation *usecase.PaymentCreation
 }
 
-// NewPayment creates the PaymentService server.
-func NewPayment(query *usecase.PaymentQuery) *Payment {
-	return &Payment{query: query}
+// NewPayment creates the PaymentService server; creation may be nil when the
+// quote and connector clients are not wired (CreatePayment answers
+// Unavailable fail-closed).
+func NewPayment(query *usecase.PaymentQuery, creation *usecase.PaymentCreation) *Payment {
+	return &Payment{query: query, creation: creation}
+}
+
+// CreatePayment creates the payment of the idempotent request: the quote is
+// locked, the connector invoice is created and the response carries the pay
+// amount, the address or the checkout page (4.2).
+func (s *Payment) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymentRequest) (*paymentv1.CreatePaymentResponse, error) {
+	if s.creation == nil {
+		return nil, grpcmw.E(grpcmw.KindUnavailable, "service_unavailable", "создание платежей не подключено", nil)
+	}
+	merchantID := strings.TrimSpace(req.GetMerchantId())
+	if _, err := uuid.Parse(merchantID); err != nil {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_merchant_id", "merchant_id не UUID", nil)
+	}
+	if len(merchantID) > maxMerchantIDLen {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_merchant_id", "merchant_id длиннее предела", nil)
+	}
+	key := strings.TrimSpace(req.GetIdempotencyKey())
+	if key == "" || len(key) > maxIdempotencyKeyLen {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_idempotency_key", "idempotency_key обязателен и ограничен", nil)
+	}
+	amount := req.GetAmount()
+	if amount == nil || amount.GetMinorUnits() <= 0 {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_amount", "amount должен быть положительным", nil)
+	}
+	if amount.GetDecimals() > kitmoney.MaxDecimals || !domain.ValidAssetCode(amount.GetAsset()) {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_amount", "amount вне границ", nil)
+	}
+	if !domain.ValidAssetCode(req.GetPayAsset()) {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_pay_asset", "pay_asset вне границ", nil)
+	}
+	network := strings.TrimSpace(req.GetNetwork())
+	if !domain.ValidNetwork(network) {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_network", "network обязателен и ограничен", nil)
+	}
+	if req.GetExpiresAt() == nil {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_expires_at", "expires_at обязателен", nil)
+	}
+	expiresAt := req.GetExpiresAt().AsTime().UTC()
+	// The expiry window (future, horizon) is enforced by the creation service
+	// for a new payment only: a replay of the original request must return the
+	// stored result even after its own expiry (FR-2).
+
+	payment, err := s.creation.Create(ctx, usecase.CreatePaymentRequest{
+		MerchantID:     merchantID,
+		IdempotencyKey: key,
+		Amount:         kitmoney.Money{MinorUnits: amount.GetMinorUnits(), Asset: amount.GetAsset(), Decimals: amount.GetDecimals()},
+		PayAsset:       req.GetPayAsset(),
+		Network:        network,
+		ExpiresAt:      expiresAt,
+	})
+	if err != nil {
+		return nil, mapCreationError(err)
+	}
+	response := &paymentv1.CreatePaymentResponse{
+		PaymentId: payment.ID,
+		State:     stateToProto(domain.State(payment.State)),
+	}
+	if payment.QuoteID != nil {
+		response.QuoteId = *payment.QuoteID
+	}
+	if payment.Rate != nil {
+		response.Rate = *payment.Rate
+	}
+	if payment.QuoteLockedUntil != nil {
+		response.LockedUntil = timestamppb.New(payment.QuoteLockedUntil.UTC())
+	}
+	response.ExpectedAmount = money(payment.ExpectedAmount, payment.ExpectedAsset, payment.ExpectedDecimals)
+	if payment.PayAddress != nil {
+		response.PayAddress = *payment.PayAddress
+	}
+	if payment.CheckoutURL != nil {
+		response.CheckoutUrl = *payment.CheckoutURL
+	}
+	if payment.ExpiresAt != nil {
+		response.ExpiresAt = timestamppb.New(payment.ExpiresAt.UTC())
+	}
+	return response, nil
+}
+
+// CancelPayment cancels a payment before detection; a repeated cancel replays
+// the previous result (4.2).
+func (s *Payment) CancelPayment(ctx context.Context, req *paymentv1.CancelPaymentRequest) (*paymentv1.CancelPaymentResponse, error) {
+	if s.creation == nil {
+		return nil, grpcmw.E(grpcmw.KindUnavailable, "service_unavailable", "создание платежей не подключено", nil)
+	}
+	paymentID := strings.TrimSpace(req.GetPaymentId())
+	if _, err := uuid.Parse(paymentID); err != nil {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_payment_id", "payment_id не UUID", nil)
+	}
+	key := strings.TrimSpace(req.GetIdempotencyKey())
+	if key == "" || len(key) > maxIdempotencyKeyLen {
+		return nil, grpcmw.E(grpcmw.KindInvalidArgument, "invalid_idempotency_key", "idempotency_key обязателен и ограничен", nil)
+	}
+	payment, err := s.creation.Cancel(ctx, paymentID, key)
+	if err != nil {
+		return nil, mapCreationError(err)
+	}
+	return &paymentv1.CancelPaymentResponse{Payment: paymentToProto(payment, nil)}, nil
 }
 
 // GetPayment returns a payment with the transition history and the locked
@@ -260,7 +363,39 @@ func mapPaymentError(err error) error {
 	case errors.Is(err, storage.ErrNotFound):
 		return grpcmw.E(grpcmw.KindNotFound, "payment_not_found", "платеж не найден", nil)
 	case errors.Is(err, storage.ErrInvalidCursor):
-		return grpcmw.E(grpcmw.KindInvalidArgument, "invalid_cursor", "курсор списка некорректен", nil)
+		return grpcmw.E(grpcmw.KindInvalidArgument, "invalid_cursor", "неверный курсор страницы", nil)
+	default:
+		return err
+	}
+}
+
+// mapCreationError converts the creation flow errors to platform errors (4.2):
+// business rejections are preconditions, dependency failures are retryable and
+// malformed input is invalid.
+func mapCreationError(err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return grpcmw.E(grpcmw.KindNotFound, "payment_not_found", "платеж не найден", nil)
+	case errors.Is(err, domain.ErrIdempotencyConflict):
+		return grpcmw.E(grpcmw.KindAlreadyExists, "idempotency_key_reuse", "ключ идемпотентности переиспользован с другим запросом", nil)
+	case errors.Is(err, domain.ErrQuoteRejected):
+		return grpcmw.E(grpcmw.KindFailedPrecondition, "quote_rejected", "курс недоступен для запрошенной пары или суммы", nil)
+	case errors.Is(err, domain.ErrInvoiceRejected):
+		return grpcmw.E(grpcmw.KindFailedPrecondition, "invoice_rejected", "провайдер отклонил создание инвойса", nil)
+	case errors.Is(err, domain.ErrInvoiceNotCancellable):
+		return grpcmw.E(grpcmw.KindFailedPrecondition, "invoice_not_cancellable", "платеж уже нельзя отменить", nil)
+	case errors.Is(err, domain.ErrPayAmount):
+		return grpcmw.E(grpcmw.KindFailedPrecondition, "pay_amount_invalid", "сконвертированная сумма недопустима", nil)
+	case errors.Is(err, domain.ErrInvalidCreation), errors.Is(err, domain.ErrInvalidExpiry),
+		errors.Is(err, domain.ErrUnknownAssetScale):
+		return grpcmw.E(grpcmw.KindInvalidArgument, "invalid_creation_request", "запрос создания платежа некорректен", nil)
+	case errors.Is(err, domain.ErrOverloaded):
+		return grpcmw.E(grpcmw.KindResourceExhausted, "service_unavailable", "сервис перегружен, повторите позже", nil)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcmw.E(grpcmw.KindUnavailable, "service_unavailable", "сервис временно недоступен", nil)
+	case errors.Is(err, domain.ErrInvalidRate), errors.Is(err, domain.ErrStateConflict),
+		errors.Is(err, domain.ErrDependencyTemporary):
+		return grpcmw.E(grpcmw.KindUnavailable, "service_unavailable", "сервис временно недоступен", nil)
 	default:
 		return err
 	}

@@ -13,8 +13,9 @@ schema-registry, payment in the `app` profile with a fast janitor,
 
 | Scenario | Checks | Contracts |
 | :-- | :-- | :-- |
-| `E2E_Payment_Schema` | goose migrations to version 6, the full state chain creating -> created -> pending -> detected -> confirming -> completed with a per-step transition journal, the DB barriers (forbidden backward transition, append-only transition journal, the derived top-up insert barrier: a completed row without a parent is rejected), janitor expiry and stuck-creation handling (expired / failed / detected intact), outbox rows payment.expired/payment.failed published by the relay, and the gRPC read API (GetPayment quote/txid/confirmations/timeline, ListPayments merchant/state/period filters, NotFound). The repeated-deposit top-up flow itself is exercised by the Kafka testcontainers scenario `E2E_Payment_CanonicalKafka` (successive cumulative deposits crediting against the baseline, a case-variant txid replay folded) | payment schema and state machine (CBL-4.1), janitor (CBL-4.6), outbox (CBL-4.7), read API (CBL-4.8), provider rules (CBL-17.10); gRPC PaymentService (CF-3.3/cf-3.4) |
+| `E2E_Payment_Schema` | goose migrations to version 7, the full state chain creating -> created -> pending -> detected -> confirming -> completed with a per-step transition journal, the DB barriers (forbidden backward transition, append-only transition journal, the derived top-up insert barrier: a completed row without a parent is rejected, the expected-amount fill allowed only on creating -> created, the parent link immutable), janitor expiry and stuck-creation handling (expired / failed / detected intact), outbox rows payment.expired/payment.failed published by the relay, and the gRPC read API (GetPayment quote/txid/confirmations/timeline, ListPayments merchant/state/period filters, NotFound). The repeated-deposit top-up flow itself is exercised by the Kafka testcontainers scenario `E2E_Payment_CanonicalKafka` (successive cumulative deposits crediting against the baseline, a case-variant txid replay folded) | payment schema and state machine (CBL-4.1), janitor (CBL-4.6), outbox (CBL-4.7), read API (CBL-4.8), provider rules (CBL-17.10), creation fill (CBL-4.2); gRPC PaymentService (CF-3.3/cf-3.4) |
 | `E2E_Payment_CanonicalKafka` | testcontainers Kafka+PostgreSQL (`make test-e2e`): canonical events over the topic drive the state machine, duplicates are deduplicated by the inbox; since 17.10 a repeated confirmed deposit above the recorded amount (new txid) creates a linked completed top-up child, the parent stays untouched and the child `payment.completed` reaches `payment.events` | canonical consumer (CBL-4.3/4.5), provider rules (CBL-17.10); CF-2/CF-4 events |
+| `E2E_Payment_CreatePayment` | testcontainers PostgreSQL with in-process stub Quote and Connector gRPC servers behind the real clients: the happy creation reaches `pending` with the locked quote and the converted pay amount, the replay returns the same payment without new external calls, a different body under the same key conflicts, a connector timeout leaves the payment in `created` and the retry resumes to `pending` without a second quote, cancel is idempotent and `invoice_not_cancellable` after detection, and the unwired handler answers Unavailable fail-closed (test `TestE2ECreatePaymentContour`) | creation flow (CBL-4.2); QuoteService LockQuote and ConnectorService CreateInvoice (CF-1) |
 
 ## 2. Isolation and parallelism
 
@@ -35,9 +36,9 @@ schema-registry, payment in the `app` profile with a fast janitor,
    (output to `compose-down.log`; the first run has nothing to stop).
 3. Start the stand: `docker compose -p cbl-payment-e2e-<MARK> -f deploy/docker-compose.yml --profile app up -d --build --wait`
    (`compose-up.log`); `docker compose ps` into `compose-ps.txt`.
-4. Wait for migrations to version 6 (retry up to 60 s):
+4. Wait for migrations to version 7 (retry up to 60 s):
    `docker compose -p ... exec -T postgres psql -U cbl -d payment -v ON_ERROR_STOP=1 -t -A -c "SELECT max(version_id) FROM goose_db_version"`
-   must print `6`.
+   must print `7`.
 5. Create the events topic (topic auto-creation is disabled):
    `docker compose -p ... exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic payment.events --partitions 1 --replication-factor 1`.
 6. Run the scenario steps (section 4), appending every SQL transcript to `schema.log`
@@ -103,7 +104,21 @@ Utility notes:
 8. Every step records an OK/FAIL line in `schema-checks.txt` (check name, expected,
    actual).
 
-## 5. Mandatory run artifacts
+## 5. E2E_Payment_CreatePayment (testcontainers)
+
+1. `<MARK>` = current UTC time in lowercase; create `test/e2e/.runs/<MARK>/`.
+2. Run `go test -tags e2e ./test/e2e/ -count=1 -run TestE2ECreatePaymentContour -v`
+   (transcript to `create-payment.log`); the test starts its own PostgreSQL
+   container, real Quote/Connector stub gRPC servers over TCP, the real clients
+   and the payment gRPC server with the kit error middleware.
+3. Checks go to `create-payment-checks.txt`: the happy path reaching `pending`
+   with the converted amount and the address, the replay without new external
+   calls, the key conflict, the connector-timeout resume from `created`, the
+   idempotent cancel, `invoice_not_cancellable` after detection and the
+   fail-closed `Unavailable` without the wiring.
+4. `summary.md` by the `.additionals/summary.template.md` template.
+
+## 6. Mandatory run artifacts
 
 - `summary.md` (template `.additionals/summary.template.md`; PASS/FAIL verdict, steps,
   key values, artifact list, time);
@@ -112,7 +127,7 @@ Utility notes:
 - on failure: container states, the payment container log fragments (janitor, outbox
   relay, gRPC errors), the failing SQL and its raw output.
 
-## 6. Auxiliary files (.additionals)
+## 7. Auxiliary files (.additionals)
 
 - `summary.template.md` - the `summary.md` template;
 - `inventory.md` - the list of auxiliary files and their purpose.
@@ -121,7 +136,7 @@ The stand-side e2e tests on testcontainers (`make test-e2e`,
 `test/e2e/canonical_kafka_test.go`) are a separate local check and do not use the
 compose stand.
 
-## 7. Cleanup
+## 8. Cleanup
 
 `docker compose -p cbl-payment-e2e-<MARK> -f deploy/docker-compose.yml --profile app down -v`
 at the end; `.runs/` is not committed; a repeated run must start from a clean stand.

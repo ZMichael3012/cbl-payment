@@ -66,7 +66,7 @@ func setupPaymentServer(t *testing.T) (paymentv1.PaymentServiceClient, *gorm.DB)
 
 	listener := bufconn.Listen(1 << 20)
 	server := grpc.NewServer(grpc.UnaryInterceptor(grpcmw.UnaryServer(zap.NewNop())))
-	paymentv1.RegisterPaymentServiceServer(server, grpcserver.NewPayment(query))
+	paymentv1.RegisterPaymentServiceServer(server, grpcserver.NewPayment(query, nil))
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 

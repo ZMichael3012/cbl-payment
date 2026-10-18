@@ -72,6 +72,9 @@ services:
       KAFKA_BROKERS: kafka:29092
       # Fast janitor for the e2e scenarios in test/e2e/E2E.md (local stand).
       PAYMENT_JANITOR_INTERVAL: 2s
+      # Creation flow (4.2): this stand carries no quote/connector services, so
+      # the clients stay disabled and CreatePayment answers Unavailable
+      # fail-closed; the umbrella compose wires the real addresses.
     ports:
       - "8030:8030"
       - "9030:9030"

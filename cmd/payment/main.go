@@ -32,7 +32,9 @@ import (
 	"github.com/cbl/cbl-kit/outbox/kafkapub"
 	"github.com/cbl/cbl-kit/storagex"
 
+	"github.com/cbl/cbl-payment/internal/connectorclient"
 	"github.com/cbl/cbl-payment/internal/domain"
+	"github.com/cbl/cbl-payment/internal/quoteclient"
 	"github.com/cbl/cbl-payment/internal/storage"
 	"github.com/cbl/cbl-payment/internal/transport/grpcserver"
 	"github.com/cbl/cbl-payment/internal/usecase"
@@ -142,6 +144,46 @@ func main() {
 	} else {
 		log.Warn("payment janitor disabled (PAYMENT_JANITOR_INTERVAL=0)")
 	}
+
+	// Creation flow (4.2): the quote and connector clients are wired when both
+	// addresses are configured; otherwise CreatePayment answers Unavailable
+	// fail-closed and the reads keep working.
+	var creation *usecase.PaymentCreation
+	quoteAddr := strings.TrimSpace(os.Getenv("QUOTE_GRPC_ADDR"))
+	connectorAddr := strings.TrimSpace(os.Getenv("CONNECTOR_GRPC_ADDR"))
+	if quoteAddr != "" && connectorAddr != "" {
+		quoteClient, dialErr := quoteclient.Dial(quoteAddr)
+		if dialErr != nil {
+			log.Error("quote client failed", zap.Error(dialErr))
+			return
+		}
+		defer func() { _ = quoteClient.Close() }()
+		connectorClient, dialErr := connectorclient.Dial(connectorAddr)
+		if dialErr != nil {
+			log.Error("connector client failed", zap.Error(dialErr))
+			return
+		}
+		defer func() { _ = connectorClient.Close() }()
+		assetScales, scaleErr := parseAssetScales(os.Getenv("PAYMENT_ASSET_DECIMALS"))
+		if scaleErr != nil {
+			log.Error("parse PAYMENT_ASSET_DECIMALS failed", zap.Error(scaleErr))
+			return
+		}
+		creation, err = usecase.NewPaymentCreation(repo, quoteClient, connectorClient, usecase.CreationConfig{
+			AssetScales: assetScales,
+			Log:         log,
+		})
+		if err != nil {
+			log.Error("payment creation configuration failed", zap.Error(err))
+			return
+		}
+		log.Info("payment creation wired",
+			zap.String("quote", quoteAddr),
+			zap.String("connector", connectorAddr),
+			zap.Int("asset_scales", len(assetScales)))
+	} else {
+		log.Warn("payment creation is disabled: QUOTE_GRPC_ADDR and CONNECTOR_GRPC_ADDR are required")
+	}
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		brokerList := splitCSV(brokers)
 		publisher, pubErr := kafkapub.New(brokerList)
@@ -203,7 +245,7 @@ func main() {
 	healthSrv := health.NewServer()
 	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
-	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcserver.NewPayment(usecase.NewPaymentQuery(repo)))
+	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcserver.NewPayment(usecase.NewPaymentQuery(repo), creation))
 	reflection.Register(grpcSrv)
 
 	grpcListener, err := net.Listen("tcp", grpcAddr)
@@ -341,4 +383,30 @@ func splitCSV(raw string) []string {
 		}
 	}
 	return values
+}
+
+// parseAssetScales parses the PAYMENT_ASSET_DECIMALS CSV (ASSET:SCALE): the
+// pay asset scales of the creation flow (4.2). An unknown asset fails closed
+// at request time and an empty or malformed configuration refuses startup.
+func parseAssetScales(raw string) (map[string]uint32, error) {
+	scales := make(map[string]uint32)
+	for _, item := range splitCSV(raw) {
+		asset, scaleRaw, found := strings.Cut(item, ":")
+		asset = strings.ToUpper(strings.TrimSpace(asset))
+		if !found || asset == "" {
+			return nil, fmt.Errorf("payment: invalid asset scale %q", item)
+		}
+		scale, err := strconv.Atoi(strings.TrimSpace(scaleRaw))
+		if err != nil || scale < 0 || scale > 18 {
+			return nil, fmt.Errorf("payment: invalid asset scale %q", item)
+		}
+		if _, duplicate := scales[asset]; duplicate {
+			return nil, fmt.Errorf("payment: duplicate asset scale %q", asset)
+		}
+		scales[asset] = uint32(scale)
+	}
+	if len(scales) == 0 {
+		return nil, errors.New("payment: no asset scales configured")
+	}
+	return scales, nil
 }

@@ -21,7 +21,7 @@ import (
 func TestPaymentIdValidation(t *testing.T) {
 	t.Parallel()
 
-	server := NewPayment(nil)
+	server := NewPayment(nil, nil)
 	ctx := context.Background()
 
 	_, err := server.GetPayment(ctx, &paymentv1.GetPaymentRequest{})
@@ -36,7 +36,7 @@ func TestPaymentIdValidation(t *testing.T) {
 func TestListPaymentsValidation(t *testing.T) {
 	t.Parallel()
 
-	server := NewPayment(nil)
+	server := NewPayment(nil, nil)
 	ctx := context.Background()
 
 	_, err := server.ListPayments(ctx, &paymentv1.ListPaymentsRequest{})
