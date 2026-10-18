@@ -187,6 +187,16 @@ func (f *failingStore) TransitionTx(ctx context.Context, tx *gorm.DB, id string,
 	return f.repo.TransitionTx(ctx, tx, id, expectedVersion, to, patch)
 }
 
+// CreateDerivedTx delegates to the repository (unused by the atomicity test).
+func (f *failingStore) CreateDerivedTx(ctx context.Context, tx *gorm.DB, payment storage.Payment, reason string) (storage.Payment, error) {
+	return f.repo.CreateDerivedTx(ctx, tx, payment, reason)
+}
+
+// LockAndSumTopUpsTx delegates to the repository (unused by the atomicity test).
+func (f *failingStore) LockAndSumTopUpsTx(ctx context.Context, tx *gorm.DB, parentID string) (int64, error) {
+	return f.repo.LockAndSumTopUpsTx(ctx, tx, parentID)
+}
+
 func TestIntegrationCanonicalConsumerTransactionalAtomicity(t *testing.T) {
 	db := setupConsumerDB(t)
 	repo := storage.NewRepository(db)

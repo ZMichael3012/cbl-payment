@@ -13,7 +13,8 @@ schema-registry, payment in the `app` profile with a fast janitor,
 
 | Scenario | Checks | Contracts |
 | :-- | :-- | :-- |
-| `E2E_Payment_Schema` | goose migrations to version 5, the full state chain creating -> created -> pending -> detected -> confirming -> completed with a per-step transition journal, the DB barriers (forbidden backward transition, append-only transition journal), janitor expiry and stuck-creation handling (expired / failed / detected intact), outbox rows payment.expired/payment.failed published by the relay, and the gRPC read API (GetPayment quote/txid/confirmations/timeline, ListPayments merchant/state/period filters, NotFound) | payment schema and state machine (CBL-4.1), janitor (CBL-4.6), outbox (CBL-4.7), read API (CBL-4.8); gRPC PaymentService (CF-3.3/cf-3.4) |
+| `E2E_Payment_Schema` | goose migrations to version 6, the full state chain creating -> created -> pending -> detected -> confirming -> completed with a per-step transition journal, the DB barriers (forbidden backward transition, append-only transition journal, the derived top-up insert barrier: a completed row without a parent is rejected), janitor expiry and stuck-creation handling (expired / failed / detected intact), outbox rows payment.expired/payment.failed published by the relay, and the gRPC read API (GetPayment quote/txid/confirmations/timeline, ListPayments merchant/state/period filters, NotFound). The repeated-deposit top-up flow itself is exercised by the Kafka testcontainers scenario `E2E_Payment_CanonicalKafka` (successive cumulative deposits crediting against the baseline, a case-variant txid replay folded) | payment schema and state machine (CBL-4.1), janitor (CBL-4.6), outbox (CBL-4.7), read API (CBL-4.8), provider rules (CBL-17.10); gRPC PaymentService (CF-3.3/cf-3.4) |
+| `E2E_Payment_CanonicalKafka` | testcontainers Kafka+PostgreSQL (`make test-e2e`): canonical events over the topic drive the state machine, duplicates are deduplicated by the inbox; since 17.10 a repeated confirmed deposit above the recorded amount (new txid) creates a linked completed top-up child, the parent stays untouched and the child `payment.completed` reaches `payment.events` | canonical consumer (CBL-4.3/4.5), provider rules (CBL-17.10); CF-2/CF-4 events |
 
 ## 2. Isolation and parallelism
 
@@ -34,9 +35,9 @@ schema-registry, payment in the `app` profile with a fast janitor,
    (output to `compose-down.log`; the first run has nothing to stop).
 3. Start the stand: `docker compose -p cbl-payment-e2e-<MARK> -f deploy/docker-compose.yml --profile app up -d --build --wait`
    (`compose-up.log`); `docker compose ps` into `compose-ps.txt`.
-4. Wait for migrations to version 5 (retry up to 60 s):
+4. Wait for migrations to version 6 (retry up to 60 s):
    `docker compose -p ... exec -T postgres psql -U cbl -d payment -v ON_ERROR_STOP=1 -t -A -c "SELECT max(version_id) FROM goose_db_version"`
-   must print `5`.
+   must print `6`.
 5. Create the events topic (topic auto-creation is disabled):
    `docker compose -p ... exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic payment.events --partitions 1 --replication-factor 1`.
 6. Run the scenario steps (section 4), appending every SQL transcript to `schema.log`
@@ -70,11 +71,14 @@ Utility notes:
    -> detected (v4, txid `tx-e2e`, received amount 1000 USDT/2) -> confirming (v5,
    confirmations 1) -> completed (v6, confirmations 6, completed_at now()).
    Expect `state:version` = `completed:6` and exactly 6 transitions.
-4. DB barrier checks (both must be REJECTED):
+4. DB barrier checks (all three must be REJECTED):
    - backward transition: `UPDATE payments SET state = 'pending', state_version = 7 WHERE id = '<id>'`
      fails with `forbidden` (transition guard trigger);
    - journal rewrite: `UPDATE payment_transitions SET reason = 'rewritten' WHERE payment_id = '<id>'`
-     fails with `append-only`.
+     fails with `append-only`;
+   - derived top-up insert (`17.10`): `INSERT INTO payments (... state 'completed', state_version 1,
+     completed_at now())` without `parent_payment_id` fails with `must start in creating`
+     (insert guard).
 5. Janitor seeds (three payments, each chain in a single `-c` call):
    - expired: chain to `pending` with `expires_at = now() - interval '1 minute'`;
    - stuck creation: state `creating` with `created_at`/`updated_at` 10 minutes in the

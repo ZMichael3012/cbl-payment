@@ -102,14 +102,20 @@ func setupE2EKafka(t *testing.T) []string {
 // canonicalRecord builds a Kafka record of a canonical event.
 func canonicalRecord(t *testing.T, eventType eventsv1.CanonicalPaymentEventType, confirmations uint32) *kgo.Record {
 	t.Helper()
+	return canonicalRecordWith(t, eventType, confirmations, 100_000, "tx-e2e")
+}
+
+// canonicalRecordWith builds a canonical record with an explicit amount and txid.
+func canonicalRecordWith(t *testing.T, eventType eventsv1.CanonicalPaymentEventType, confirmations uint32, amount int64, txid string) *kgo.Record {
+	t.Helper()
 	event := &eventsv1.CanonicalPaymentEvent{
 		PaymentId:      canonicalE2EPaymentID,
 		GatewayId:      "g-e2e",
 		Provider:       "mock",
 		Type:           eventType,
-		ReceivedAmount: &commonv1.Money{MinorUnits: 100_000, Asset: "USDT", Decimals: 2},
+		ReceivedAmount: &commonv1.Money{MinorUnits: amount, Asset: "USDT", Decimals: 2},
 		Confirmations:  confirmations,
-		Txid:           "tx-e2e",
+		Txid:           txid,
 		Network:        "trc20",
 	}
 	body, err := proto.Marshal(event)
@@ -253,6 +259,63 @@ func TestCanonicalConsumerKafkaFlow(t *testing.T) {
 	require.NoError(t, proto.Unmarshal(byType["payment.completed"].Value, &completed))
 	assert.Equal(t, int64(100_000), completed.GetReceivedAmount().GetMinorUnits())
 	assert.Equal(t, "tx-e2e", completed.GetTxid())
+
+	// 17.10: a repeated confirmed deposit above the baseline attributed to the
+	// parent creates a linked completed top-up child and one more completed
+	// event; the hex txid is canonicalized for the identity.
+	topUp := canonicalRecordWith(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED, 3, 150_000, "0xAbCdEf01")
+	require.NoError(t, producer.ProduceSync(ctx, topUp).FirstErr())
+	waitForInboxCount(t, ctx, db, 4)
+
+	var child storage.Payment
+	require.Eventually(t, func() bool {
+		return db.Where("parent_payment_id = ?", canonicalE2EPaymentID).First(&child).Error == nil
+	}, 30*time.Second, 200*time.Millisecond, "the top-up child must appear")
+	assert.Equal(t, string(domain.StateCompleted), child.State)
+	require.NotNil(t, child.ReceivedAmount)
+	assert.Equal(t, int64(50_000), *child.ReceivedAmount)
+	require.NotNil(t, child.TxID)
+	assert.Equal(t, "abcdef01", *child.TxID, "the hex txid is lowercased and unprefixed for the identity")
+
+	// A case-variant replay of the same txid above the baseline is a duplicate:
+	// no second child appears (B1/M1).
+	replay := canonicalRecordWith(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED, 3, 180_000, "0xabcdef01")
+	require.NoError(t, producer.ProduceSync(ctx, replay).FirstErr())
+	waitForInboxCount(t, ctx, db, 5)
+	var childCount int64
+	require.NoError(t, db.Model(&storage.Payment{}).Where("parent_payment_id = ?", canonicalE2EPaymentID).Count(&childCount).Error)
+	assert.EqualValues(t, 1, childCount, "a case-variant replay must not create a second child")
+
+	// A successive cumulative deposit credits only the part above the credited
+	// baseline (B1): the second child carries the 30k delta.
+	second := canonicalRecordWith(t, eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED, 3, 180_000, "0xDeadBeef02")
+	require.NoError(t, producer.ProduceSync(ctx, second).FirstErr())
+	waitForInboxCount(t, ctx, db, 6)
+	require.Eventually(t, func() bool {
+		var count int64
+		return db.Model(&storage.Payment{}).Where("parent_payment_id = ?", canonicalE2EPaymentID).Count(&count).Error == nil && count == 2
+	}, 30*time.Second, 200*time.Millisecond, "the successive top-up child must appear")
+	var secondChild storage.Payment
+	require.NoError(t, db.Where("parent_payment_id = ? AND txid = ?", canonicalE2EPaymentID, "deadbeef02").First(&secondChild).Error)
+	require.NotNil(t, secondChild.ReceivedAmount)
+	assert.Equal(t, int64(30_000), *secondChild.ReceivedAmount)
+
+	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)
+	assert.Equal(t, int64(6), outboxCount, "each child completion extends the outbox")
+
+	topUpEvents := consumePaymentEvents(t, ctx, brokers, 6)
+	childIDs := map[string]bool{child.ID: false, secondChild.ID: false}
+	for i := range topUpEvents {
+		id := string(topUpEvents[i].Key)
+		if _, ok := childIDs[id]; !ok {
+			continue
+		}
+		var payload eventsv1.PaymentEvent
+		require.NoError(t, proto.Unmarshal(topUpEvents[i].Value, &payload))
+		assert.Equal(t, eventsv1.PaymentEventType_PAYMENT_EVENT_TYPE_COMPLETED, payload.GetType())
+		childIDs[id] = true
+	}
+	assert.True(t, childIDs[child.ID] && childIDs[secondChild.ID], "both top-up children must reach payment.events")
 }
 
 // recordHeader returns the value of a Kafka record header.

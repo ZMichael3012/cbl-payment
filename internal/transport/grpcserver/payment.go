@@ -130,6 +130,15 @@ func paymentToProto(payment storage.Payment, history []storage.Transition) *paym
 	if payment.TxID != nil {
 		result.Txid = *payment.TxID
 	}
+	if payment.Provider != nil {
+		result.Provider = *payment.Provider
+	}
+	if payment.RawStatus != nil {
+		result.RawStatus = *payment.RawStatus
+	}
+	if payment.CheckoutURL != nil {
+		result.CheckoutUrl = *payment.CheckoutURL
+	}
 	if payment.Confirmations > 0 {
 		result.Confirmations = uint32(payment.Confirmations) //nolint:gosec // CHECK 0 - 1000000
 	}

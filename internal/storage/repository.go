@@ -88,6 +88,18 @@ type Payment struct {
 	GatewayID *string `gorm:"column:gateway_id"`
 	// Provider holds the gateway provider name.
 	Provider *string `gorm:"column:provider"`
+	// RawStatus holds the provider status string untouched (17.10).
+	RawStatus *string `gorm:"column:raw_status"`
+	// CheckoutURL holds the hosted payment page of hosted providers (17.10).
+	CheckoutURL *string `gorm:"column:checkout_url"`
+	// GatewayFee holds the gateway fee component in minor units (17.10).
+	GatewayFee *int64 `gorm:"column:gateway_fee"`
+	// NetworkFee holds the network fee component in minor units (17.10).
+	NetworkFee *int64 `gorm:"column:network_fee"`
+	// FxSpread holds the fx spread component in minor units (17.10).
+	FxSpread *int64 `gorm:"column:fx_spread"`
+	// ParentPaymentID holds the parent of a repeated-deposit top-up (17.10).
+	ParentPaymentID *string `gorm:"column:parent_payment_id"`
 	// TxID holds the network transaction hash.
 	TxID *string `gorm:"column:txid"`
 	// Confirmations holds the number of network confirmations.
@@ -153,6 +165,16 @@ type TransitionPatch struct {
 	GatewayID *string
 	// Provider holds the gateway provider.
 	Provider *string
+	// RawStatus holds the provider raw status (17.10).
+	RawStatus *string
+	// CheckoutURL holds the hosted checkout url (17.10).
+	CheckoutURL *string
+	// GatewayFee holds the gateway fee component (17.10).
+	GatewayFee *int64
+	// NetworkFee holds the network fee component (17.10).
+	NetworkFee *int64
+	// FxSpread holds the fx spread component (17.10).
+	FxSpread *int64
 	// TxID holds the network transaction hash.
 	TxID *string
 	// Network holds the payment network from the canonical event.
@@ -310,6 +332,104 @@ func (r *Repository) TransitionTx(ctx context.Context, tx *gorm.DB, id string, e
 		return Payment{}, fmt.Errorf("storage: transition payment %s: %w", id, err)
 	}
 	return updated, nil
+}
+
+// CreateDerived inserts a derived completed payment (a repeated-deposit top-up
+// of a terminal parent, 17.10): the row starts directly in completed (the
+// insert guard allows it only for parented rows), the audit transition is
+// version 1 and the payment.completed event goes to the outbox in the same
+// transaction. A taken top-up identity (merchant idempotency key or the parent
+// and txid) returns ErrDuplicateKey.
+func (r *Repository) CreateDerived(ctx context.Context, tx *gorm.DB, payment Payment, reason string) (Payment, error) {
+	db := tx
+	if db == nil {
+		db = r.db
+	}
+	now := time.Now().UTC()
+	payment.State = string(domain.StateCompleted)
+	payment.StateVersion = 1
+	if payment.CompletedAt == nil {
+		payment.CompletedAt = &now
+	}
+	payment.CreatedAt = now
+	payment.UpdatedAt = now
+	err := db.WithContext(ctx).Transaction(func(inner *gorm.DB) error {
+		if createErr := inner.Create(&payment).Error; createErr != nil {
+			if isTopUpUniqueViolation(createErr) {
+				return fmt.Errorf("%w: derived payment for parent %v", ErrDuplicateKey, payment.ParentPaymentID)
+			}
+			return createErr
+		}
+		history := Transition{
+			PaymentID:    payment.ID,
+			FromState:    "",
+			ToState:      payment.State,
+			StateVersion: 1,
+			Reason:       reason,
+			OccurredAt:   now,
+		}
+		if createErr := inner.Create(&history).Error; createErr != nil {
+			return createErr
+		}
+		return r.emitTransitionEvent(ctx, inner, TransitionEvent{
+			Payment:    payment,
+			From:       "",
+			To:         domain.StateCompleted,
+			OccurredAt: now,
+		})
+	})
+	if err != nil {
+		return Payment{}, fmt.Errorf("storage: create derived payment: %w", err)
+	}
+	return payment, nil
+}
+
+// CreateDerivedTx implements the canonical consumer storage port (17.10).
+func (r *Repository) CreateDerivedTx(ctx context.Context, tx *gorm.DB, payment Payment, reason string) (Payment, error) {
+	return r.CreateDerived(ctx, tx, payment, reason)
+}
+
+// LockAndSumTopUpsTx locks the parent payment row and returns the baseline
+// already attributed to it (17.10, B1): the recorded received amount plus the
+// sum of the derived children. The row lock serializes concurrent canonical
+// events of one parent, so successive top-ups credit only the new delta.
+// A parent without a recorded amount or a sum overflowing int64 is an error.
+func (r *Repository) LockAndSumTopUpsTx(ctx context.Context, tx *gorm.DB, parentID string) (int64, error) {
+	db := tx
+	if db == nil {
+		db = r.db
+	}
+	var row struct {
+		ReceivedAmount *int64
+	}
+	if err := db.WithContext(ctx).
+		Raw("SELECT received_amount FROM payments WHERE id = ? FOR UPDATE", parentID).
+		Scan(&row).Error; err != nil {
+		return 0, fmt.Errorf("storage: lock top-up parent %s: %w", parentID, err)
+	}
+	if row.ReceivedAmount == nil {
+		return 0, fmt.Errorf("storage: top-up parent %s has no recorded amount", parentID)
+	}
+	var sum int64
+	if err := db.WithContext(ctx).
+		Raw("SELECT COALESCE(SUM(received_amount), 0)::bigint FROM payments WHERE parent_payment_id = ? AND state = ?",
+			parentID, string(domain.StateCompleted)).
+		Scan(&sum).Error; err != nil {
+		return 0, fmt.Errorf("storage: sum top-ups of %s: %w", parentID, err)
+	}
+	return *row.ReceivedAmount + sum, nil
+}
+
+// isTopUpUniqueViolation reports that the database error is a taken top-up
+// identity (17.10): the merchant idempotency key or the parent and txid index.
+// Any other unique violation is a bug and is not masked as a duplicate.
+func isTopUpUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return false
+	}
+	return pgErr.ConstraintName == "payments_merchant_idempotency_idx" ||
+		pgErr.ConstraintName == "payments_topup_txid_idx"
 }
 
 // Get returns a payment and its transition history in ascending version order;
@@ -503,6 +623,21 @@ func (p TransitionPatch) updates() map[string]any {
 	}
 	if p.Provider != nil {
 		updates["provider"] = *p.Provider
+	}
+	if p.RawStatus != nil {
+		updates["raw_status"] = *p.RawStatus
+	}
+	if p.CheckoutURL != nil {
+		updates["checkout_url"] = *p.CheckoutURL
+	}
+	if p.GatewayFee != nil {
+		updates["gateway_fee"] = *p.GatewayFee
+	}
+	if p.NetworkFee != nil {
+		updates["network_fee"] = *p.NetworkFee
+	}
+	if p.FxSpread != nil {
+		updates["fx_spread"] = *p.FxSpread
 	}
 	if p.TxID != nil {
 		updates["txid"] = *p.TxID

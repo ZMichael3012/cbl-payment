@@ -28,11 +28,13 @@ const canonicalPaymentID = "01a13d53-6bf5-707f-a944-c0d73586547e"
 
 // fakeCanonicalStore implements usecase.CanonicalStore over memory.
 type fakeCanonicalStore struct {
-	payment     storage.Payment
-	notFound    bool
-	conflicts   int
-	transitions []domain.State
-	patches     []storage.TransitionPatch
+	payment       storage.Payment
+	notFound      bool
+	conflicts     int
+	transitions   []domain.State
+	patches       []storage.TransitionPatch
+	derived       []storage.Payment
+	topUpBaseline int64
 }
 
 // PaymentTx returns the state of the fake payment.
@@ -95,6 +97,87 @@ func (f *fakeCanonicalStore) TransitionTx(_ context.Context, _ *gorm.DB, _ strin
 	f.transitions = append(f.transitions, to)
 	f.patches = append(f.patches, patch)
 	return f.payment, nil
+}
+
+// CreateDerivedTx records a derived top-up insert over the fake store.
+func (f *fakeCanonicalStore) CreateDerivedTx(_ context.Context, _ *gorm.DB, payment storage.Payment, _ string) (storage.Payment, error) {
+	f.derived = append(f.derived, payment)
+	return payment, nil
+}
+
+// LockAndSumTopUpsTx returns the fixed test baseline when set; otherwise it
+// derives the baseline from the recorded amount plus the accepted children.
+func (f *fakeCanonicalStore) LockAndSumTopUpsTx(_ context.Context, _ *gorm.DB, _ string) (int64, error) {
+	if f.topUpBaseline > 0 {
+		return f.topUpBaseline, nil
+	}
+	var baseline int64
+	if f.payment.ReceivedAmount != nil {
+		baseline = *f.payment.ReceivedAmount
+	}
+	for _, child := range f.derived {
+		if child.ReceivedAmount != nil {
+			baseline += *child.ReceivedAmount
+		}
+	}
+	return baseline, nil
+}
+
+// topUpConfirmed assembles a confirmed event with the explicit amount and txid.
+func topUpConfirmed(amount int64, txid string) *eventsv1.CanonicalPaymentEvent {
+	event := detectedEvent()
+	event.Type = eventsv1.CanonicalPaymentEventType_CANONICAL_PAYMENT_EVENT_TYPE_CONFIRMED
+	event.ReceivedAmount = &commonv1.Money{MinorUnits: amount, Asset: "USDT", Decimals: 2}
+	event.Txid = txid
+	return event
+}
+
+func TestCanonicalConsumerTopUpSuccessive(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore(domain.StateCompleted, 4)
+	received := int64(100_000)
+	store.payment.ReceivedAmount = &received
+	consumer := usecase.NewCanonicalConsumer(store, zap.NewNop())
+	ctx := context.Background()
+
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, topUpConfirmed(150_000, "tx-a"))))
+	require.Len(t, store.derived, 1)
+	assert.Equal(t, int64(50_000), store.derived[0].ExpectedAmount)
+
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, topUpConfirmed(180_000, "tx-b"))))
+	require.Len(t, store.derived, 2)
+	assert.Equal(t, int64(30_000), store.derived[1].ExpectedAmount, "successive events credit only the new part")
+}
+
+func TestCanonicalConsumerTopUpWithoutTxid(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore(domain.StateCompleted, 4)
+	received := int64(100_000)
+	store.payment.ReceivedAmount = &received
+	consumer := usecase.NewCanonicalConsumer(store, zap.NewNop())
+	ctx := context.Background()
+
+	require.NoError(t, consumer.Handle(ctx, nil, canonicalMessage(t, topUpConfirmed(150_000, "  "))))
+	assert.Empty(t, store.derived, "a deposit without a txid is not credited")
+}
+
+func TestCanonicalConsumerRawStatusRejectsControlCharacters(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"bad\nstatus", "bad\u0085status", "bad\u2028status", "raw\u007fstatus"} {
+		raw := raw
+		t.Run("raw", func(t *testing.T) {
+			t.Parallel()
+			store := newFakeStore(domain.StatePending, 2)
+			consumer := usecase.NewCanonicalConsumer(store, zap.NewNop())
+			ctx := context.Background()
+
+			event := detectedEvent()
+			event.RawStatus = raw
+			err := consumer.Handle(ctx, nil, canonicalMessage(t, event))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "raw_status is invalid")
+		})
+	}
 }
 
 // canonicalMessage assembles an inbox message with the serialized event.

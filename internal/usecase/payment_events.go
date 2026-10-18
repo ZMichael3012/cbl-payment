@@ -89,6 +89,11 @@ func BuildPaymentEventEnvelope(event storage.TransitionEvent) (outbox.Envelope, 
 		QuoteId: derefString(event.Payment.QuoteID),
 		Rate:    derefString(event.Payment.Rate),
 		Txid:    derefString(event.Payment.TxID),
+		// Provider integration fields (CF-4, 17.10): the reporting and
+		// reconciliation consumers attribute the payment by the provider and
+		// keep the raw provider status.
+		Provider:  derefString(event.Payment.Provider),
+		RawStatus: derefString(event.Payment.RawStatus),
 		// The version is guaranteed positive (CHECK >= 1).
 		StateVersion: uint64(event.Payment.StateVersion), //nolint:gosec
 		OccurredAt:   timestamppb.New(event.OccurredAt.UTC()),
@@ -98,6 +103,16 @@ func BuildPaymentEventEnvelope(event storage.TransitionEvent) (outbox.Envelope, 
 	}
 	if fee := moneyFrom(event.Payment.FeeAmount, event.Payment.FeeAsset, event.Payment.FeeDecimals); fee != nil {
 		payload.Fee = fee
+	}
+	// The split components share the asset and the scale of the fee (17.10).
+	if gateway := moneyFrom(event.Payment.GatewayFee, event.Payment.FeeAsset, event.Payment.FeeDecimals); gateway != nil {
+		payload.GatewayFee = gateway
+	}
+	if network := moneyFrom(event.Payment.NetworkFee, event.Payment.FeeAsset, event.Payment.FeeDecimals); network != nil {
+		payload.NetworkFee = network
+	}
+	if fx := moneyFrom(event.Payment.FxSpread, event.Payment.FeeAsset, event.Payment.FeeDecimals); fx != nil {
+		payload.FxSpread = fx
 	}
 	body, err := proto.Marshal(payload)
 	if err != nil {

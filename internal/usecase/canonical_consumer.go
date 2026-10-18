@@ -17,6 +17,8 @@ import (
 	"github.com/cbl/cbl-kit/inbox"
 	"github.com/cbl/cbl-kit/outbox"
 
+	commonv1 "github.com/cbl/cbl-protos/gen/go/billing/common/v1"
+
 	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"
 )
@@ -49,6 +51,11 @@ type CanonicalStore interface {
 	PaymentTx(ctx context.Context, tx *gorm.DB, id string) (storage.Payment, error)
 	// TransitionTx performs an optimistic state transition.
 	TransitionTx(ctx context.Context, tx *gorm.DB, id string, expectedVersion uint64, to domain.State, patch storage.TransitionPatch) (storage.Payment, error)
+	// CreateDerivedTx inserts a derived completed top-up payment (17.10).
+	CreateDerivedTx(ctx context.Context, tx *gorm.DB, payment storage.Payment, reason string) (storage.Payment, error)
+	// LockAndSumTopUpsTx locks the parent row and returns the baseline already
+	// attributed to it (the recorded amount plus the derived children).
+	LockAndSumTopUpsTx(ctx context.Context, tx *gorm.DB, parentID string) (int64, error)
 }
 
 // CanonicalConsumer translates gateway canonical events into payment state
@@ -148,6 +155,13 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 			return fmt.Errorf("usecase: canonical plan for %s: %w", payment.ID, planErr)
 		}
 		if len(plan) == 0 {
+			handled, topUpErr := c.handleTopUp(ctx, tx, payment, current, &event, eventType)
+			if topUpErr != nil {
+				return topUpErr
+			}
+			if handled {
+				return nil
+			}
 			// Money on the network after invoice expiry needs manual review
 			// (KI-payment-08): the event arrived late in processing order, but
 			// the payment cannot simply be dropped - a separate message for
@@ -181,7 +195,12 @@ func (c *CanonicalConsumer) Handle(ctx context.Context, tx *gorm.DB, msg inbox.M
 			patch := storage.TransitionPatch{Reason: "canonical " + string(eventType)}
 			if i == len(plan)-1 {
 				// Event data is recorded on the target state (FR-3).
+				feeInfo, feeErr := feePatch(&event, payment)
+				if feeErr != nil {
+					return feeErr
+				}
 				patch = mergePatches(patch, received, canonicalPatch(&event, eventType))
+				patch = mergePatches(patch, nil, feeInfo)
 				if target == domain.StateCompleted || target == domain.StateUnderpaid || target == domain.StateOverpaid {
 					completedAt := c.clock().UTC()
 					patch.CompletedAt = &completedAt
@@ -289,7 +308,7 @@ func validateReceived(event *eventsv1.CanonicalPaymentEvent, payment storage.Pay
 		return nil, fmt.Errorf("%w: received asset %q", errInvalidCanonicalEvent, shortID(received.GetAsset()))
 	}
 	if asset != payment.ExpectedAsset || int(received.GetDecimals()) != payment.ExpectedDecimals {
-		return nil, fmt.Errorf("%w: received %s/%d does not match expected %s/%d",
+		return nil, fmt.Errorf("%w: wrong asset deposit: received %s/%d does not match expected %s/%d",
 			errInvalidCanonicalEvent, asset, received.GetDecimals(), payment.ExpectedAsset, payment.ExpectedDecimals)
 	}
 	amount := received.GetMinorUnits()
@@ -326,7 +345,26 @@ func validateEventCommon(event *eventsv1.CanonicalPaymentEvent, eventType domain
 			return fmt.Errorf("%w: %s is too long", errInvalidCanonicalEvent, name)
 		}
 	}
+	// The raw provider status is persisted and re-emitted: the bound matches the
+	// payments.raw_status CHECK (17.10), and non-printable characters are
+	// rejected so the value cannot inject into logs or downstream output (E-8).
+	if rawStatus := event.GetRawStatus(); len(rawStatus) > 64 || !printableASCII(rawStatus) {
+		return fmt.Errorf("%w: raw_status is invalid", errInvalidCanonicalEvent)
+	}
 	return nil
+}
+
+// printableASCII reports that the string contains only printable ASCII
+// characters (0x20 - 0x7E): control characters (C0 and C1, DEL) and Unicode
+// separators are rejected so raw_status cannot inject into logs or downstream
+// consumers (E-8).
+func printableASCII(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalPatch assembles the event data patch (identifiers, confirmations).
@@ -340,6 +378,9 @@ func canonicalPatch(event *eventsv1.CanonicalPaymentEvent, eventType domain.Cano
 	}
 	if provider := strings.TrimSpace(event.GetProvider()); provider != "" {
 		patch.Provider = &provider
+	}
+	if rawStatus := strings.TrimSpace(event.GetRawStatus()); rawStatus != "" {
+		patch.RawStatus = &rawStatus
 	}
 	if network := strings.TrimSpace(event.GetNetwork()); network != "" {
 		patch.Network = &network
@@ -359,6 +400,15 @@ func mergePatches(base storage.TransitionPatch, extra *storage.TransitionPatch, 
 		merged.ReceivedAsset = extra.ReceivedAsset
 		merged.ReceivedDecimals = extra.ReceivedDecimals
 	}
+	if event.FeeAmount != nil {
+		merged.FeeAmount = event.FeeAmount
+	}
+	if event.FeeAsset != nil {
+		merged.FeeAsset = event.FeeAsset
+	}
+	if event.FeeDecimals != nil {
+		merged.FeeDecimals = event.FeeDecimals
+	}
 	if event.TxID != nil {
 		merged.TxID = event.TxID
 	}
@@ -367,6 +417,21 @@ func mergePatches(base storage.TransitionPatch, extra *storage.TransitionPatch, 
 	}
 	if event.Provider != nil {
 		merged.Provider = event.Provider
+	}
+	if event.RawStatus != nil {
+		merged.RawStatus = event.RawStatus
+	}
+	if event.CheckoutURL != nil {
+		merged.CheckoutURL = event.CheckoutURL
+	}
+	if event.GatewayFee != nil {
+		merged.GatewayFee = event.GatewayFee
+	}
+	if event.NetworkFee != nil {
+		merged.NetworkFee = event.NetworkFee
+	}
+	if event.FxSpread != nil {
+		merged.FxSpread = event.FxSpread
 	}
 	if event.Network != nil {
 		merged.Network = event.Network
@@ -389,4 +454,162 @@ func validAsset(asset string) bool {
 		}
 	}
 	return true
+}
+
+// handleTopUp credits a repeated deposit of a terminal-success payment as a
+// derived completed child (17.10, decisions 9/10): only a confirmed event above
+// the baseline already attributed to the parent (the recorded amount plus the
+// existing derived children, read under the parent row lock) with a txid forms
+// a credited delta; a missing txid keeps the deposit on the manual-review path.
+// The second value reports that the event was consumed (either credited or
+// deliberately left for review).
+func (c *CanonicalConsumer) handleTopUp(ctx context.Context, tx *gorm.DB, payment storage.Payment, current domain.State, event *eventsv1.CanonicalPaymentEvent, eventType domain.CanonicalEventType) (bool, error) {
+	if eventType != domain.CanonicalConfirmed || payment.ReceivedAmount == nil {
+		return false, nil
+	}
+	switch current {
+	case domain.StateCompleted, domain.StateUnderpaid, domain.StateOverpaid:
+	default:
+		return false, nil
+	}
+	baseline, err := c.store.LockAndSumTopUpsTx(ctx, tx, payment.ID)
+	if err != nil {
+		return false, fmt.Errorf("usecase: topup baseline of %s: %w", payment.ID, err)
+	}
+	eventReceived := event.GetReceivedAmount().GetMinorUnits()
+	txid := domain.CanonicalTxID(event.GetTxid())
+	delta, outcome := domain.TopUpDelta(current, eventType, &baseline, eventReceived, txid)
+	switch outcome {
+	case domain.TopUpSkip:
+		return false, nil
+	case domain.TopUpManualReview:
+		// A deposit without a transaction hash cannot be deduplicated against a
+		// repeated delivery: it must not be credited automatically (KI-payment-10).
+		c.log.Warn("topup deposit without txid needs manual review",
+			zap.String("payment_id", payment.ID),
+			zap.Int64("baseline", baseline),
+			zap.Int64("event_received", eventReceived))
+		return true, nil
+	}
+	childID, err := uuid.NewV7()
+	if err != nil {
+		return false, fmt.Errorf("usecase: topup payment id: %w", err)
+	}
+	received := delta
+	asset := payment.ExpectedAsset
+	decimals := payment.ExpectedDecimals
+	child := storage.Payment{
+		ID:               childID.String(),
+		MerchantID:       payment.MerchantID,
+		IdempotencyKey:   "topup:" + payment.ID + ":" + txid,
+		RequestHash:      "topup:" + payment.ID + ":" + txid,
+		ExpectedAmount:   delta,
+		ExpectedAsset:    asset,
+		ExpectedDecimals: decimals,
+		ReceivedAmount:   &received,
+		ReceivedAsset:    &asset,
+		ReceivedDecimals: &decimals,
+		Network:          payment.Network,
+		TxID:             &txid,
+		Confirmations:    int(event.GetConfirmations()),
+		ParentPaymentID:  &payment.ID,
+	}
+	if provider := strings.TrimSpace(event.GetProvider()); provider != "" {
+		child.Provider = &provider
+	} else if payment.Provider != nil {
+		child.Provider = payment.Provider
+	}
+	if gatewayID := strings.TrimSpace(event.GetGatewayId()); gatewayID != "" {
+		child.GatewayID = &gatewayID
+	} else if payment.GatewayID != nil {
+		child.GatewayID = payment.GatewayID
+	}
+	if rawStatus := strings.TrimSpace(event.GetRawStatus()); rawStatus != "" {
+		child.RawStatus = &rawStatus
+	}
+	reason := "topup deposit of " + payment.ID + " txid " + txid
+	created, err := c.store.CreateDerivedTx(ctx, tx, child, reason)
+	if errors.Is(err, storage.ErrDuplicateKey) {
+		c.log.Warn("topup duplicate skipped",
+			zap.String("payment_id", payment.ID),
+			zap.String("txid", shortID(txid)))
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("usecase: topup deposit of %s: %w", payment.ID, err)
+	}
+	c.log.Info("topup deposit credited",
+		zap.String("parent_payment_id", payment.ID),
+		zap.String("child_payment_id", created.ID),
+		zap.Int64("delta", delta),
+		zap.String("txid", shortID(txid)))
+	return true, nil
+}
+
+// feePatch validates the provider fee split of a money event and assembles the
+// storage patch: the canonical contract carries only the components (cf-4.1),
+// the total is their sum following FeeTotal, and the components are persisted
+// for the payment.events payload (17.10, D5).
+func feePatch(event *eventsv1.CanonicalPaymentEvent, payment storage.Payment) (storage.TransitionPatch, error) {
+	gateway := event.GetGatewayFee()
+	network := event.GetNetworkFee()
+	fx := event.GetFxSpread()
+	if gateway == nil && network == nil && fx == nil {
+		return storage.TransitionPatch{}, nil
+	}
+	if event.GetReceivedAmount() == nil {
+		return storage.TransitionPatch{}, fmt.Errorf("%w: fee split without received_amount", errInvalidCanonicalEvent)
+	}
+	for name, part := range map[string]*commonv1.Money{
+		"gateway_fee": gateway,
+		"network_fee": network,
+		"fx_spread":   fx,
+	} {
+		if part == nil {
+			continue
+		}
+		if part.GetMinorUnits() < 0 {
+			return storage.TransitionPatch{}, fmt.Errorf("%w: negative %s", errInvalidCanonicalEvent, name)
+		}
+		// A zero component is treated as absent; a non-zero one must carry the
+		// exact payment asset and scale (E-5), otherwise the money is rejected.
+		if part.GetMinorUnits() == 0 {
+			continue
+		}
+		if asset := strings.ToUpper(strings.TrimSpace(part.GetAsset())); asset != payment.ExpectedAsset {
+			return storage.TransitionPatch{}, fmt.Errorf("%w: %s asset does not match the payment", errInvalidCanonicalEvent, name)
+		}
+		if int(part.GetDecimals()) != payment.ExpectedDecimals {
+			return storage.TransitionPatch{}, fmt.Errorf("%w: %s scale does not match the payment", errInvalidCanonicalEvent, name)
+		}
+	}
+	received := event.GetReceivedAmount().GetMinorUnits()
+	total, err := domain.FeeTotal(0, moneyAmount(gateway), moneyAmount(network), moneyAmount(fx), received)
+	if err != nil {
+		return storage.TransitionPatch{}, fmt.Errorf("%w: %w", errInvalidCanonicalEvent, err)
+	}
+	asset := payment.ExpectedAsset
+	decimals := payment.ExpectedDecimals
+	patch := storage.TransitionPatch{FeeAmount: &total, FeeAsset: &asset, FeeDecimals: &decimals}
+	if gateway != nil {
+		value := gateway.GetMinorUnits()
+		patch.GatewayFee = &value
+	}
+	if network != nil {
+		value := network.GetMinorUnits()
+		patch.NetworkFee = &value
+	}
+	if fx != nil {
+		value := fx.GetMinorUnits()
+		patch.FxSpread = &value
+	}
+	return patch, nil
+}
+
+// moneyAmount returns the minor units of an optional money (nil means zero).
+func moneyAmount(value *commonv1.Money) int64 {
+	if value == nil {
+		return 0
+	}
+	return value.GetMinorUnits()
 }

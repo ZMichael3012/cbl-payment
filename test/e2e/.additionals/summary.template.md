@@ -18,7 +18,7 @@ progresses.
 | :-- | :-- | :-- | :-- | :-- |
 | 1 | down -v | docker compose ... | OK | compose-down.log |
 | 2 | up --build --wait | docker compose ... | OK | compose-up.log, compose-ps.txt |
-| 3 | migrations v5 + topic | psql goose_db_version, kafka-topics | OK | schema.log |
+| 3 | migrations v6 + topic | psql goose_db_version, kafka-topics | OK | schema.log |
 | 4 | scenario | chain, barriers, janitor, outbox, gRPC | OK | schema.log, schema-checks.txt |
 | 5 | down -v | docker compose ... | OK | compose-down.log |
 

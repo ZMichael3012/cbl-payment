@@ -118,6 +118,30 @@ func TestStateMappingRoundTrip(t *testing.T) {
 	assert.Equal(t, grpcmw.KindInvalidArgument, grpcmw.KindOf(err))
 }
 
+func TestPaymentToProtoProviderFields(t *testing.T) {
+	t.Parallel()
+	provider := "bitpay"
+	rawStatus := "paid"
+	checkout := "https://pay.example/invoice/1"
+	payment := storage.Payment{
+		ID:               "01a13d53-6bf5-707f-a944-c0d73586547e",
+		MerchantID:       "m-1",
+		State:            string(domain.StatePending),
+		StateVersion:     2,
+		ExpectedAmount:   100_000,
+		ExpectedAsset:    "USDT",
+		ExpectedDecimals: 2,
+		Network:          "trc20",
+		Provider:         &provider,
+		RawStatus:        &rawStatus,
+		CheckoutURL:      &checkout,
+	}
+	result := paymentToProto(payment, nil)
+	assert.Equal(t, provider, result.GetProvider())
+	assert.Equal(t, rawStatus, result.GetRawStatus())
+	assert.Equal(t, checkout, result.GetCheckoutUrl())
+}
+
 func TestMapPaymentError(t *testing.T) {
 	t.Parallel()
 
