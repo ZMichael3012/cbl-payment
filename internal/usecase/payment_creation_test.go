@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cbl/cbl-kit/money"
+	"github.com/ZMichael3012/cbl-kit/money"
 
 	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"

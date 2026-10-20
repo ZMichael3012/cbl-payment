@@ -23,11 +23,11 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	commonv1 "github.com/cbl/cbl-protos/gen/go/billing/common/v1"
-	paymentv1 "github.com/cbl/cbl-protos/gen/go/billing/payment/v1"
+	commonv1 "github.com/ZMichael3012/cbl-protos/gen/go/billing/common/v1"
+	paymentv1 "github.com/ZMichael3012/cbl-protos/gen/go/billing/payment/v1"
 
-	"github.com/cbl/cbl-kit/grpcmw"
-	"github.com/cbl/cbl-kit/storagex"
+	"github.com/ZMichael3012/cbl-kit/grpcmw"
+	"github.com/ZMichael3012/cbl-kit/storagex"
 
 	"github.com/cbl/cbl-payment/internal/domain"
 	"github.com/cbl/cbl-payment/internal/storage"

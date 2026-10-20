@@ -12,9 +12,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	connectorv1 "github.com/cbl/cbl-protos/gen/go/billing/connector/v1"
+	connectorv1 "github.com/ZMichael3012/cbl-protos/gen/go/billing/connector/v1"
 
-	"github.com/cbl/cbl-kit/money"
+	"github.com/ZMichael3012/cbl-kit/money"
 
 	"github.com/cbl/cbl-payment/internal/connectorclient"
 	"github.com/cbl/cbl-payment/internal/domain"
