@@ -62,8 +62,8 @@ services:
   payment:
     profiles: ["app"]
     build:
-      context: ../..
-      dockerfile: cbl-payment/Dockerfile
+      context: ..
+      dockerfile: Dockerfile
     environment:
       HTTP_ADDR: ":8030"
       GRPC_ADDR: ":9030"
